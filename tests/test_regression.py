@@ -315,3 +315,113 @@ class TestAuditMatrix:
             mode="summary",
         )
         assert result.is_trustworthy, "Valid summary compression should be trustworthy"
+
+
+# ---------------------------------------------------------------------------
+# v0.2.2 regression tests — from second round of audits
+# ---------------------------------------------------------------------------
+
+class TestR01AuditChainAllFields:
+
+    def test_tampered_broken_bonds_detected(self):
+        """R-01: Changing broken_bonds must break the chain."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "record.jsonl"
+            pair = capture("Claim. Because evidence.", "Claim. Different.")
+            report = find_divergences(pair)
+            verdict = render_verdict(report)
+            preserve(pair, report, verdict, path)
+
+            with open(path) as f:
+                data = json.loads(f.read().strip())
+            data["broken_bonds"] = 999
+            with open(path, "w") as f:
+                f.write(json.dumps(data) + "\n")
+
+            ok, msg = verify_chain(path)
+            assert not ok, "Tampered broken_bonds must break the chain"
+
+    def test_tampered_criterion_version_detected(self):
+        """R-01: Changing criterion_version must break the chain."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "record.jsonl"
+            pair = capture("Source.", "Source.")
+            report = find_divergences(pair)
+            verdict = render_verdict(report)
+            preserve(pair, report, verdict, path)
+
+            with open(path) as f:
+                data = json.loads(f.read().strip())
+            data["criterion_version"] = "ATTACKER"
+            with open(path, "w") as f:
+                f.write(json.dumps(data) + "\n")
+
+            ok, msg = verify_chain(path)
+            assert not ok, "Tampered criterion_version must break the chain"
+
+    def test_malformed_json_returns_false(self):
+        """verify_chain must handle malformed JSON gracefully."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "record.jsonl"
+            path.write_text("{{not valid json\n")
+            ok, msg = verify_chain(path)
+            assert not ok
+            assert "malformed" in msg.lower()
+
+
+class TestR02RecordMatchesReturnedVerdict:
+
+    def test_rag_mode_record_matches_api(self):
+        """R-02: Record must store the same findings as the API returns."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "record.jsonl"
+            result = verify(
+                source="A. B. C. D. E.",
+                output="A. Plus something new.",
+                mode="rag",
+                record_path=path,
+            )
+            entries = read_record(path)
+            assert len(entries) == 1
+            entry = entries[0]
+            # Score and level must match
+            assert abs(entry.trust_score - result.trust_score) < 0.01, \
+                f"Record score {entry.trust_score} != API score {result.trust_score}"
+            assert entry.trust_level == result.trust_level, \
+                f"Record level {entry.trust_level} != API level {result.trust_level}"
+
+
+class TestAntonymDetection:
+
+    def test_innocent_to_guilty(self):
+        """'innocent' → 'guilty' must be caught as predicate reversal."""
+        result = verify(
+            source="The defendant is innocent.",
+            output="The defendant is guilty.",
+            mode="strict",
+        )
+        assert not result.is_trustworthy
+        critical = [d for d in result.divergences if d.severity == Severity.CRITICAL]
+        assert len(critical) >= 1
+
+    def test_true_to_false(self):
+        result = verify(
+            source="The statement is true.",
+            output="The statement is false.",
+            mode="strict",
+        )
+        assert not result.is_trustworthy
+
+
+class TestNumericCanonicalization:
+
+    def test_comma_separator_not_flagged(self):
+        """'1,000' and '1000' are the same number."""
+        result = verify(
+            source="The trial enrolled 1,000 participants.",
+            output="The trial enrolled 1000 participants.",
+            mode="strict",
+        )
+        numeric_divs = [d for d in result.divergences
+                       if "Numeric" in d.explanation or "numeric" in d.explanation.lower()]
+        assert len(numeric_divs) == 0, "1,000 and 1000 should not be flagged as different"

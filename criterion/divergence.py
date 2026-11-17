@@ -329,7 +329,9 @@ def _extract_numbers(text: str) -> set[str]:
                     suffix = _SUFFIX_CANONICAL[next_tok]
                     i += 1  # Skip the magnitude word
             if num_part:
-                normalized.add(num_part + suffix)
+                # Canonicalize: remove thousands separators
+                canonical = num_part.replace(',', '') + suffix
+                normalized.add(canonical)
         i += 1
     return normalized
 
@@ -397,25 +399,50 @@ def _classify_matched_pair(
             verification_method=f"Check whether the negation change inverts the factual claim",
         )
 
-    # Prefix-negation / antonym detection — "safe" vs "unsafe", "legal" vs "illegal"
+    # Prefix-negation / antonym detection
     _NEG_PREFIXES = ("un", "in", "im", "il", "ir", "dis", "non")
-    for src_w in src_words:
-        for out_w in out_words:
-            if src_w == out_w:
+    # Common antonym pairs that cannot be caught by prefix negation
+    _ANTONYM_PAIRS = {
+        ("innocent", "guilty"), ("true", "false"), ("alive", "dead"),
+        ("present", "absent"), ("accept", "reject"), ("allow", "deny"),
+        ("approve", "reject"), ("confirm", "deny"), ("increase", "decrease"),
+        ("rise", "fall"), ("success", "failure"), ("win", "lose"),
+        ("gain", "loss"), ("profit", "loss"), ("positive", "negative"),
+        ("include", "exclude"), ("open", "closed"), ("open", "close"),
+        ("start", "stop"), ("begin", "end"), ("buy", "sell"),
+        ("guilty", "innocent"), ("safe", "dangerous"), ("good", "bad"),
+    }
+    # Build bidirectional lookup
+    _ANTONYM_SET = _ANTONYM_PAIRS | {(b, a) for a, b in _ANTONYM_PAIRS}
+
+    # Only check words that actually changed between source and output
+    # Strip trailing punctuation for comparison
+    for src_w_raw in removed_words:
+        for out_w_raw in added_words:
+            src_w = src_w_raw.strip('.,;:!?()"\'')
+            out_w = out_w_raw.strip('.,;:!?()"\'')
+            if not src_w or not out_w or src_w == out_w:
                 continue
-            # Check if one is the negated form of the other
+            # Check prefix negation
+            is_reversal = False
             for pfx in _NEG_PREFIXES:
                 if out_w == pfx + src_w or src_w == pfx + out_w:
-                    return Divergence(
-                        dtype=DivergenceType.SURFACING,
-                        severity=Severity.CRITICAL,
-                        source_atom=source,
-                        output_atom=output,
-                        explanation=f"Predicate reversal: '{src_w}' vs '{out_w}' — meaning inverted",
-                        confidence=0.9,
-                        suggested_correction=source.text,
-                        verification_method=f"Compare: source says '{src_w}', output says '{out_w}'",
-                    )
+                    is_reversal = True
+                    break
+            # Check antonym pairs
+            if not is_reversal and (src_w, out_w) in _ANTONYM_SET:
+                is_reversal = True
+            if is_reversal:
+                return Divergence(
+                    dtype=DivergenceType.SURFACING,
+                    severity=Severity.CRITICAL,
+                    source_atom=source,
+                    output_atom=output,
+                    explanation=f"Predicate reversal: '{src_w}' vs '{out_w}' — meaning inverted",
+                    confidence=0.9,
+                    suggested_correction=source.text,
+                    verification_method=f"Compare: source says '{src_w}', output says '{out_w}'",
+                )
 
     # --- End critical checks. Near-identical text can return early now. ---
     if similarity > 0.95:

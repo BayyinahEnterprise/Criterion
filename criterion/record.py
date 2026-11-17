@@ -199,6 +199,8 @@ def preserve(
     # will be detected by verify_chain().
     divs_json = json.dumps(divs_serialized, sort_keys=True, ensure_ascii=False)
     bond_divs_json = json.dumps(bond_divs_serialized, sort_keys=True, ensure_ascii=False)
+    version = "0.2.2"
+    broken_bonds_count = len(verdict.bond_divergences)
     entry_id = _hash_content(
         pair.source.sha256,
         pair.output.sha256,
@@ -209,7 +211,9 @@ def preserve(
         str(verdict.total_divergences),
         divs_json,
         bond_divs_json,
+        str(broken_bonds_count),
         verdict.summary,
+        version,
     )
 
     entry = RecordEntry(
@@ -227,7 +231,7 @@ def preserve(
         bond_divergences=bond_divs_serialized,
         broken_bonds=verdict.broken_bonds,
         summary=verdict.summary,
-        criterion_version="0.2.1",
+        criterion_version=version,
     )
 
     _write_entry(entry, path)
@@ -271,7 +275,9 @@ def _recompute_entry_id(entry: RecordEntry) -> str:
         str(entry.total_divergences),
         divs_json,
         bond_divs_json,
+        str(entry.broken_bonds),
         entry.summary,
+        entry.criterion_version,
     )
 
 
@@ -297,7 +303,10 @@ def verify_chain(record_path: Path | str | None = None) -> tuple[bool, str]:
     Returns (True, "ok") if the chain is valid, or
     (False, "description of break") if tampered.
     """
-    entries = read_record(record_path)
+    try:
+        entries = read_record(record_path)
+    except (json.JSONDecodeError, TypeError, KeyError) as e:
+        return False, f"malformed record: {e}"
     if not entries:
         return True, "empty record"
 

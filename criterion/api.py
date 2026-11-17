@@ -217,9 +217,14 @@ def verify(
     filtered_divs = _apply_mode(verdict.divergences, resolved_mode)
     filtered_bond_divs = verdict.bond_divergences
 
+    # Imports for rescoring and record building
+    from criterion.verdict import (
+        Verdict as _Verdict, _compute_trust_score, _classify_trust,
+        _compute_direction,
+    )
+
     # Re-score with filtered divergences if mode changed anything
     if len(filtered_divs) != len(verdict.divergences):
-        from criterion.verdict import _compute_trust_score, _classify_trust, TrustLevel
         score = _compute_trust_score(filtered_divs, filtered_bond_divs)
         crit = sum(1 for d in filtered_divs if d.severity == Severity.CRITICAL)
         maj = sum(1 for d in filtered_divs if d.severity == Severity.MAJOR)
@@ -232,10 +237,24 @@ def verify(
         crit = verdict.critical_count
         maj = verdict.major_count
 
-    # Record
+    # Record — store the FILTERED verdict so record matches what was returned
     record_id = None
     if record:
-        entry = preserve(pair, report, verdict, record_path)
+        filtered_verdict = _Verdict(
+            trust_score=score,
+            trust_level=level,
+            total_divergences=len(filtered_divs) + len(filtered_bond_divs),
+            critical_count=crit,
+            major_count=maj,
+            minor_count=sum(1 for d in filtered_divs if d.severity == Severity.MINOR),
+            cosmetic_count=sum(1 for d in filtered_divs if d.severity == Severity.COSMETIC),
+            broken_bonds=len(filtered_bond_divs),
+            direction=_compute_direction(filtered_divs),
+            summary=_build_filtered_summary(level, score, filtered_divs, filtered_bond_divs),
+            divergences=filtered_divs,
+            bond_divergences=filtered_bond_divs,
+        )
+        entry = preserve(pair, report, filtered_verdict, record_path)
         record_id = entry.entry_id
 
     minor = sum(1 for d in filtered_divs if d.severity == Severity.MINOR)

@@ -21,6 +21,7 @@ import criterion
 result = criterion.verify(
     source="The vaccine is safe. Clinical trials with 40,000 participants showed no serious adverse effects.",
     output="The vaccine is safe.",
+    mode="strict",
 )
 print(result.trust_level)        # "divergent"
 print(result.trust_score)        # 0.38
