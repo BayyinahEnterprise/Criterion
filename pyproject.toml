@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "criterion-ai"
-version = "0.2.0"
+version = "0.2.1"
 description = "A trust layer for AI-generated content. Your AI's output looks right. Criterion checks whether it is."
 readme = "README.md"
 license = {text = "MIT"}

@@ -194,11 +194,22 @@ def preserve(
     divs_serialized = [_serialize_divergence(d) for d in verdict.divergences]
     bond_divs_serialized = [_serialize_bond_divergence(bd) for bd in verdict.bond_divergences]
 
+    # Hash ALL integrity-protected fields, not just source/output/time.
+    # This ensures modifying any field (verdict, divergences, summary)
+    # will be detected by verify_chain().
+    divs_json = json.dumps(divs_serialized, sort_keys=True, ensure_ascii=False)
+    bond_divs_json = json.dumps(bond_divs_serialized, sort_keys=True, ensure_ascii=False)
     entry_id = _hash_content(
         pair.source.sha256,
         pair.output.sha256,
         now,
         predecessor,
+        str(verdict.trust_score),
+        verdict.trust_level.value,
+        str(verdict.total_divergences),
+        divs_json,
+        bond_divs_json,
+        verdict.summary,
     )
 
     entry = RecordEntry(
@@ -216,7 +227,7 @@ def preserve(
         bond_divergences=bond_divs_serialized,
         broken_bonds=verdict.broken_bonds,
         summary=verdict.summary,
-        criterion_version="0.1.0",
+        criterion_version="0.2.1",
     )
 
     _write_entry(entry, path)
@@ -243,8 +254,45 @@ def read_record(record_path: Path | str | None = None) -> list[RecordEntry]:
     return entries
 
 
+def _recompute_entry_id(entry: RecordEntry) -> str:
+    """Recompute an entry's ID from its content fields.
+
+    If this doesn't match the stored entry_id, the content was tampered with.
+    """
+    divs_json = json.dumps(entry.divergences, sort_keys=True, ensure_ascii=False)
+    bond_divs_json = json.dumps(entry.bond_divergences, sort_keys=True, ensure_ascii=False)
+    return _hash_content(
+        entry.source_hash,
+        entry.output_hash,
+        entry.recorded_at,
+        entry.predecessor_hash,
+        str(entry.trust_score),
+        entry.trust_level,
+        str(entry.total_divergences),
+        divs_json,
+        bond_divs_json,
+        entry.summary,
+    )
+
+
+def _verify_text_hashes(entry: RecordEntry) -> str | None:
+    """Verify that stored text matches stored hashes. Returns error or None."""
+    actual_src = hashlib.sha256(entry.source_text.encode("utf-8")).hexdigest()
+    actual_out = hashlib.sha256(entry.output_text.encode("utf-8")).hexdigest()
+    if actual_src != entry.source_hash:
+        return f"source text hash mismatch: stored {entry.source_hash[:12]}, computed {actual_src[:12]}"
+    if actual_out != entry.output_hash:
+        return f"output text hash mismatch: stored {entry.output_hash[:12]}, computed {actual_out[:12]}"
+    return None
+
+
 def verify_chain(record_path: Path | str | None = None) -> tuple[bool, str]:
     """Verify the append-only hash chain is intact.
+
+    Checks:
+    1. Predecessor links form a valid chain from genesis
+    2. Entry IDs match recomputed content hashes (tamper detection)
+    3. Source/output text hashes match the stored text
 
     Returns (True, "ok") if the chain is valid, or
     (False, "description of break") if tampered.
@@ -256,11 +304,25 @@ def verify_chain(record_path: Path | str | None = None) -> tuple[bool, str]:
     if entries[0].predecessor_hash != "genesis":
         return False, f"first entry predecessor is {entries[0].predecessor_hash!r}, expected 'genesis'"
 
-    for i in range(1, len(entries)):
-        if entries[i].predecessor_hash != entries[i - 1].entry_id:
+    for i, entry in enumerate(entries):
+        # Check predecessor chain
+        if i > 0 and entry.predecessor_hash != entries[i - 1].entry_id:
             return False, (
-                f"entry {i} predecessor {entries[i].predecessor_hash!r} "
+                f"entry {i} predecessor {entry.predecessor_hash!r} "
                 f"does not match entry {i-1} id {entries[i-1].entry_id!r}"
             )
 
-    return True, f"chain intact, {len(entries)} entries"
+        # Recompute entry ID from content — detects tampered fields
+        recomputed = _recompute_entry_id(entry)
+        if recomputed != entry.entry_id:
+            return False, (
+                f"entry {i} content hash mismatch: stored {entry.entry_id[:12]}..., "
+                f"recomputed {recomputed[:12]}... — content was modified"
+            )
+
+        # Verify source/output text matches their stored hashes
+        text_err = _verify_text_hashes(entry)
+        if text_err:
+            return False, f"entry {i}: {text_err}"
+
+    return True, f"chain intact, {len(entries)} entries verified"

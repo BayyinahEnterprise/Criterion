@@ -166,8 +166,13 @@ def _run_batch(args) -> int:
     total = len(results)
     errors = sum(1 for r in results if "error" in r)
     trustworthy = sum(1 for r in results if r.get("is_trustworthy"))
-    print(f"\n  Batch: {total} pairs → {trustworthy} trustworthy, {total - errors - trustworthy} flagged, {errors} errors")
+    untrustworthy = total - errors - trustworthy
+    print(f"\n  Batch: {total} pairs → {trustworthy} trustworthy, {untrustworthy} flagged, {errors} errors")
     print(f"  Results: {output_path}")
+    if errors:
+        return 1  # Processing errors
+    if untrustworthy > 0:
+        return 2  # Untrustworthy content found
     return 0
 
 

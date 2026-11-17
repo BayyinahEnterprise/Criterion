@@ -353,8 +353,16 @@ def _classify_matched_pair(
     # a factual fabrication. Embedding models miss this.
     src_numbers = _extract_numbers(source.text)
     out_numbers = _extract_numbers(output.text)
-    changed_numbers = (src_numbers - out_numbers) | (out_numbers - src_numbers)
-    if changed_numbers and src_numbers:
+    # Two cases to flag:
+    # 1. Output ADDS numbers not in source (fabrication)
+    # 2. Both sides have numbers but they differ (changed values)
+    # Do NOT flag when source has numbers the output simply omits
+    # (that's compression, handled by atom-level omission detector).
+    numbers_added = out_numbers - src_numbers
+    numbers_both_present_but_differ = (
+        src_numbers and out_numbers and not out_numbers.issubset(src_numbers)
+    )
+    if numbers_added or numbers_both_present_but_differ:
         return Divergence(
             dtype=DivergenceType.SURFACING,
             severity=Severity.CRITICAL,
@@ -389,22 +397,47 @@ def _classify_matched_pair(
             verification_method=f"Check whether the negation change inverts the factual claim",
         )
 
+    # Prefix-negation / antonym detection — "safe" vs "unsafe", "legal" vs "illegal"
+    _NEG_PREFIXES = ("un", "in", "im", "il", "ir", "dis", "non")
+    for src_w in src_words:
+        for out_w in out_words:
+            if src_w == out_w:
+                continue
+            # Check if one is the negated form of the other
+            for pfx in _NEG_PREFIXES:
+                if out_w == pfx + src_w or src_w == pfx + out_w:
+                    return Divergence(
+                        dtype=DivergenceType.SURFACING,
+                        severity=Severity.CRITICAL,
+                        source_atom=source,
+                        output_atom=output,
+                        explanation=f"Predicate reversal: '{src_w}' vs '{out_w}' — meaning inverted",
+                        confidence=0.9,
+                        suggested_correction=source.text,
+                        verification_method=f"Compare: source says '{src_w}', output says '{out_w}'",
+                    )
+
     # --- End critical checks. Near-identical text can return early now. ---
     if similarity > 0.95:
         return None
 
-    # Strengthening
+    # Strengthening — added intensifiers OR removed hedges
+    removed_hedges = removed_words & _HEDGE_WORDS
     added_intensifiers = added_words & _INTENSIFIERS
-    if added_intensifiers:
+    if added_intensifiers or removed_hedges:
         return Divergence(
             dtype=DivergenceType.STRENGTHENING,
             severity=Severity.MAJOR,
             source_atom=source,
             output_atom=output,
-            explanation=f"AI strengthened claim by adding: {', '.join(sorted(added_intensifiers))}",
-            confidence=min(0.6 + 0.1 * len(added_intensifiers), 0.95),
+            explanation=(
+                (f"AI strengthened claim by adding: {', '.join(sorted(added_intensifiers))}" if added_intensifiers else "")
+                + ("; " if added_intensifiers and removed_hedges else "")
+                + (f"removed hedges: {', '.join(sorted(removed_hedges))}" if removed_hedges else "")
+            ),
+            confidence=min(0.6 + 0.1 * len(added_intensifiers | removed_hedges), 0.95),
             suggested_correction=source.text,
-            verification_method=f"Compare source atom {source.index} with output atom {output.index}; source has no intensifiers",
+            verification_method=f"Compare source atom {source.index} with output atom {output.index}; hedges/qualifiers changed",
         )
 
     # Weakening
@@ -592,7 +625,9 @@ def find_divergences(pair: CapturedPair) -> DivergenceReport:
         if div is not None:
             # In summary mode, downgrade intensity shifts and compression
             # effects. Summaries reword and compress; that's their job.
-            if is_summary and div.dtype in (
+            # NEVER downgrade CRITICAL findings — numeric changes and
+            # negation/predicate inversions are factual errors regardless.
+            if is_summary and div.severity != Severity.CRITICAL and div.dtype in (
                 DivergenceType.STRENGTHENING, DivergenceType.WEAKENING,
                 DivergenceType.CONCEALING, DivergenceType.SURFACING,
             ):

@@ -19,13 +19,13 @@ pip install criterion-ai[semantic]   # + sentence embeddings for better accuracy
 import criterion
 
 result = criterion.verify(
-    source="The contract expires on March 15, 2027.",
-    output="The contract expires in early 2027.",
+    source="The vaccine is safe. Clinical trials with 40,000 participants showed no serious adverse effects.",
+    output="The vaccine is safe.",
 )
-print(result.trust_level)        # "adapted"
-print(result.trust_score)        # 0.77
-print(result.is_trustworthy)     # True
-print(result.summary)            # "1 divergence detected..."
+print(result.trust_level)        # "divergent"
+print(result.trust_score)        # 0.38
+print(result.is_trustworthy)     # False — evidence was dropped
+print(result.summary)            # "2 divergences detected. 1 critical..."
 ```
 
 ## Three modes for three jobs

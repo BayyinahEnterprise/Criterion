@@ -36,7 +36,7 @@ Architecture (Furqan reading order):
     4. record     — preserve everything append-only with hash chain
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 from criterion.api import verify, VerifyResult, Mode
 from criterion.verdict import TrustLevel

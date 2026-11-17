@@ -200,6 +200,14 @@ def verify(
     else:
         resolved_mode = mode
 
+    # Empty input invariants — a trust layer cannot call empty output "faithful"
+    source_empty = not source or not source.strip()
+    output_empty = not output or not output.strip()
+    if output_empty and not source_empty:
+        return _empty_output_result(resolved_mode, record, record_path, source, output)
+    if source_empty and not output_empty:
+        return _ungrounded_output_result(resolved_mode, record, record_path, source, output)
+
     # Run the pipeline
     pair = capture(source, output)
     report = find_divergences(pair)
@@ -242,7 +250,7 @@ def verify(
         critical_count=crit,
         major_count=maj,
         minor_count=minor,
-        summary=verdict.summary,
+        summary=_build_filtered_summary(level, score, filtered_divs, filtered_bond_divs),
         corrections=tuple(
             d.suggested_correction for d in filtered_divs
             if d.severity in (Severity.CRITICAL, Severity.MAJOR)
@@ -286,13 +294,18 @@ def _apply_mode(
         # - Additions (hallucinated content not in docs)
         # - Strengthening (overclaiming from docs)
         # - Weakening that changes meaning (not just hedging)
+        # - Any CRITICAL divergence (numeric change, negation inversion)
         result = []
         for d in divergences:
+            # Always keep critical findings regardless of type
+            if d.severity == Severity.CRITICAL:
+                result.append(d)
+                continue
             if d.dtype == DivergenceType.OMISSION:
                 continue  # Expected — answer is selective
             if d.dtype in (DivergenceType.CONCEALING, DivergenceType.DEFERRING):
                 continue  # Answer can compress and reorder
-            if d.dtype == DivergenceType.SURFACING and d.severity <= Severity.MINOR:
+            if d.dtype == DivergenceType.SURFACING and d.severity in (Severity.MINOR, Severity.COSMETIC):
                 continue  # Minor rewording is fine
             result.append(d)
         return tuple(result)
@@ -321,3 +334,68 @@ def verify_batch(
         verify(src, out, mode=mode, record_path=record_path, record=record)
         for src, out in pairs
     ]
+
+
+def _build_filtered_summary(
+    level, score, divergences, bond_divergences,
+) -> str:
+    """Build a summary from the filtered (mode-applied) findings."""
+    n = len(divergences) + len(bond_divergences)
+    if n == 0:
+        return f"The output faithfully represents the source. Trust: {level.value} ({score:.0%})."
+    parts = [f"{n} divergence{'s' if n != 1 else ''} detected."]
+    crit = sum(1 for d in divergences if d.severity == Severity.CRITICAL)
+    maj = sum(1 for d in divergences if d.severity == Severity.MAJOR)
+    if crit:
+        parts.append(f"{crit} critical.")
+    if maj:
+        parts.append(f"{maj} major.")
+    if bond_divergences:
+        parts.append(f"{len(bond_divergences)} broken bond{'s' if len(bond_divergences) != 1 else ''}.")
+    parts.append(f"Trust: {level.value} ({score:.0%}).")
+    return " ".join(parts)
+
+
+def _empty_output_result(mode, do_record, record_path, source, output) -> VerifyResult:
+    """Empty output with nonempty source is always unreliable."""
+    from criterion.verdict import TrustLevel
+    return VerifyResult(
+        trust_score=0.0,
+        trust_level="unreliable",
+        is_trustworthy=False,
+        divergences=(),
+        broken_bonds=(),
+        total_divergences=0,
+        critical_count=0,
+        major_count=0,
+        minor_count=0,
+        summary="Output is empty. No content to verify against source.",
+        corrections=(),
+        mode=mode.value,
+        record_id=None,
+        _verdict=None,
+        _report=None,
+        _pair=None,
+    )
+
+
+def _ungrounded_output_result(mode, do_record, record_path, source, output) -> VerifyResult:
+    """Nonempty output with empty source cannot be grounded."""
+    return VerifyResult(
+        trust_score=0.0,
+        trust_level="unreliable",
+        is_trustworthy=False,
+        divergences=(),
+        broken_bonds=(),
+        total_divergences=0,
+        critical_count=0,
+        major_count=0,
+        minor_count=0,
+        summary="Source is empty. Output cannot be verified as grounded.",
+        corrections=(),
+        mode=mode.value,
+        record_id=None,
+        _verdict=None,
+        _report=None,
+        _pair=None,
+    )
