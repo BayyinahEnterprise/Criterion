@@ -47,6 +47,9 @@ Every item below was reproduced against v0.3.1 first and is pinned by a test in 
 
 ### CLI, CI, SARIF
 
+- New `tests.yml` workflow runs the suite on every pull request in both configurations (core-only and with models). The repository previously had no CI that ran its tests.
+- The trust-check workflow failed on every run in this repository: it installed `criterion-ai` from PyPI, where the package has never been published. It now installs the checkout when run here, and passes with a notice when there is no pairs file. The README says how to install until the package is published.
+
 - `criterion verify <long literal text>` no longer crashes with `OSError: File name too long`.
 - `criterion batch` accepts `--record`, reads and writes UTF-8, and rejects non-string fields.
 - Workflow: installs `[all]` (it installed `[semantic]`, i.e. ran the gate without NLI), passes `--require-nli`, fails closed on rows without a verdict (was `r.get('is_trustworthy', True)`), passes inputs through `env`, and declares `permissions: contents: read`.

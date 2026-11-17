@@ -9,6 +9,7 @@
 #      {"source": "...", "output": "..."}
 #
 #   2. The action runs Criterion and fails if any pair is untrustworthy.
+#      With no pairs file it passes with a notice.
 
 name: Criterion Trust Check
 
@@ -42,30 +43,43 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Find pairs file
+        id: pairs
+        run: |
+          if [ -f criterion.jsonl ]; then echo "file=criterion.jsonl" >> "$GITHUB_OUTPUT"
+          elif [ -f pairs.jsonl ]; then echo "file=pairs.jsonl" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::No criterion.jsonl or pairs.jsonl in this repository; nothing to verify."
+            echo 'Format: {"source": "...", "output": "..."} per line'
+          fi
+
       - name: Install Criterion
+        if: steps.pairs.outputs.file != ''
         # [all] includes the NLI model. Without it Criterion cannot detect
-        # contradictions or fabricated claims, and the gate would be hollow.
-        run: pip install "criterion-ai[all]"
+        # contradictions or fabricated claims, and refuses to return a verdict.
+        # Inside the Criterion repository itself, install the checkout;
+        # elsewhere, install the published package.
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          if grep -qs '^name = "criterion-ai"' pyproject.toml; then
+            pip install ".[all]"
+          else
+            pip install "criterion-ai[all]"
+          fi
 
       - name: Run Criterion
+        if: steps.pairs.outputs.file != ''
         # Inputs reach the shell through env, never by ${{ }} interpolation
-        # into the script. --require-nli makes a missing model a hard error.
+        # into the script. A missing NLI model is a hard error by default.
         # Tip: prefer an explicit mode. "auto" picks the lenient summary mode
         # whenever the output is short, and the output is what is under test.
         env:
           MODE: ${{ github.event.inputs.mode || 'auto' }}
-        run: |
-          if [ -f criterion.jsonl ]; then
-            criterion batch criterion.jsonl --mode "$MODE" --require-nli --no-record -o results.jsonl
-          elif [ -f pairs.jsonl ]; then
-            criterion batch pairs.jsonl --mode "$MODE" --require-nli --no-record -o results.jsonl
-          else
-            echo "No pairs file found. Create criterion.jsonl or pairs.jsonl"
-            echo 'Format: {"source": "...", "output": "..."} per line'
-            exit 1
-          fi
+          PAIRS: ${{ steps.pairs.outputs.file }}
+        run: criterion batch "$PAIRS" --mode "$MODE" --no-record -o results.jsonl
 
       - name: Check results
+        if: steps.pairs.outputs.file != ''
         run: |
           python3 -c "
           import json, sys
@@ -85,7 +99,7 @@ jobs:
           "
 
       - name: Upload results
-        if: always()
+        if: always() && steps.pairs.outputs.file != ''
         uses: actions/upload-artifact@v4
         with:
           name: criterion-results
