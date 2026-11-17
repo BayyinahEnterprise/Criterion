@@ -6,12 +6,25 @@ Criterion is a trust layer for AI-generated content. It decomposes text into sem
 
 No API keys. No external services. Runs locally.
 
+> **Status: Alpha (v0.3.1).** Suitable for developer evaluation and assisted review. Not yet validated for autonomous high-stakes trust decisions. See [Limitations](#limitations) for what it catches and what it misses.
+
 ## Install
 
 ```bash
-pip install criterion-ai            # core (word-level only)
-pip install criterion-ai[semantic]   # + sentence embeddings for better accuracy
+pip install criterion-ai                # core: numeric, negation, structural checks
+pip install criterion-ai[nli]           # + NLI contradiction detection (recommended)
+pip install criterion-ai[all]           # + NLI + sentence embeddings
 ```
+
+**Which install do you need?**
+
+| Install | Size | Catches |
+|---------|------|---------|
+| `criterion-ai` | ~2 MB | Changed numbers, currency ($1K→$2K), negation inversion, prefix antonyms (safe→unsafe), broken evidence bonds, additions, omissions |
+| `criterion-ai[nli]` | ~500 MB | Everything above **plus** entity swaps (Alice→Bob), relation reversals (sold-to→bought-from), predicate swaps, inflected antonyms (increased→decreased), unit changes (mg→g), location substitution |
+| `criterion-ai[all]` | ~600 MB | Everything above + sentence-embedding similarity for paraphrase detection |
+
+**The `[nli]` install is strongly recommended.** Without it, Criterion cannot detect meaning-level contradictions where the words are similar but the facts are reversed.
 
 ## Quick start
 
@@ -36,70 +49,80 @@ print(result.summary)            # "2 divergences detected. 1 critical..."
 > Is the LLM answer grounded in the retrieved documents?
 
 ```python
-result = criterion.verify(
-    source=retrieved_documents,
-    output=llm_answer,
-    mode="rag",
-)
-
-if not result.is_trustworthy:
-    print("Hallucination detected:")
-    for d in result.divergences:
-        print(f"  {d.explanation}")
-        print(f"  Fix: {d.suggested_correction}")
+result = criterion.verify(source=retrieved_docs, output=llm_answer, mode="rag")
 ```
 
-RAG mode is strict on **additions** (fabricated content not in the docs) and **strengthening** (overclaiming), but lenient on omissions — the answer doesn't need to repeat everything from the source.
+RAG mode is strict on **additions** (fabricated content) and **strengthening** (overclaiming), lenient on omissions — the answer doesn't need to repeat everything.
 
 ### Summary verification
 
 > Does this summary faithfully represent the source?
 
 ```python
-result = criterion.verify(
-    source=long_article,
-    output=ai_summary,
-    mode="summary",
-)
+result = criterion.verify(source=long_article, output=ai_summary, mode="summary")
 ```
 
-Summary mode knows that compression and rewording are the job of a summary. It only flags changes that alter meaning: fabricated details, changed numbers, inverted negations, and dropped evidence for retained claims.
+Summary mode knows compression is the job. Flags fabricated details, changed numbers, negation inversions. Permits omissions and rewording.
 
 ### Strict comparison
 
 > Flag every deviation from the source.
 
 ```python
-result = criterion.verify(
-    source=original_contract,
-    output=revised_contract,
-    mode="strict",
-)
+result = criterion.verify(source=original, output=revised, mode="strict")
 ```
 
-Strict mode catches everything — including paraphrases, compression, and emphasis shifts. Use it for contracts, legal documents, medical records, and regulatory content.
+Everything counts — paraphrases, compression, emphasis shifts. Use for contracts, legal, medical, regulatory content.
 
 ## What it catches
 
-Criterion classifies divergences into eight types on four paired axes:
+### Deterministic checks (always available)
 
-| Axis | Inflating | Deflating |
-|------|-----------|-----------|
-| **Expansion** | Addition — content added | Omission — content removed |
-| **Intensity** | Strengthening — claims made stronger | Weakening — claims made softer |
-| **Emphasis** | Advancing — emphasis shifted forward | Deferring — emphasis buried |
-| **Visibility** | Surfacing — implicit made explicit | Concealing — explicit hidden |
+| Check | Example | Severity |
+|-------|---------|----------|
+| Numeric change | "60%" → "90%" | Critical |
+| Currency change | "$1,000" → "$2,000" | Critical |
+| Negation inversion | "was not present" → "was present" | Critical |
+| Prefix antonym | "safe" → "unsafe", "legal" → "illegal" | Critical |
+| Common antonym | "innocent" → "guilty", "true" → "false" | Critical |
+| Hedge removal | "may improve" → "will improve" | Major |
+| Intensifier added | "improved" → "always improved" | Major |
+| Evidence dropped | Claim retained, supporting evidence omitted | Critical |
+| Content added | Output contains claims not in source | Major |
+| Content omitted | Source material not in output | Varies by mode |
 
-Plus two special detectors that run before everything else:
-- **Numeric change** — catches "60%" → "90%" even when sentences are otherwise identical
-- **Negation inversion** — catches "was not present" → "was present"
+### NLI checks (requires `[nli]` install)
 
-And structural analysis:
-- **Broken bonds** — evidence dropped while claims retained (the claim is now unsupported)
+| Check | Example | Severity |
+|-------|---------|----------|
+| Entity substitution | "Alice signed" → "Bob signed" | Critical |
+| Relation reversal | "Alice sold to Bob" → "Bob sold to Alice" | Critical |
+| Predicate swap | "safe for adults, unsafe for children" → reversed | Critical |
+| Negation scope | "Alice not approved, Bob approved" → reversed | Critical |
+| Inflected antonym | "revenue increased" → "revenue decreased" | Critical |
+| Unit change | "5 mg" → "5 g" | Critical |
+| Location change | "meeting in Paris" → "meeting in London" | Critical |
+| Currency unit | "$100" → "€100" | Critical |
+
+### What it does NOT catch (known limitations)
+
+Without the NLI model installed, Criterion **cannot detect**:
+- Entity substitution (Alice → Bob) — same sentence structure, different names
+- Relation reversal (sold-to vs bought-from) — same words, different direction
+- Inflected antonyms (increased → decreased) — not in the static antonym table
+- Unit/currency unit changes ($100 → €100) — symbols are stripped for numeric comparison
+
+These require the NLI model, which classifies sentence pairs as entailment, contradiction, or neutral using a 140MB DeBERTa model.
+
+**Even with NLI, Criterion does not catch:**
+- Fabricated claims that are lexically unrelated to any source content and don't align with any source atom
+- Factual errors that require world knowledge (the source itself may be wrong)
+- Multi-sentence reasoning chains where the contradiction emerges from combining claims
+- Non-English text (all heuristics are English-only; NLI has limited multilingual capability)
+
+**Criterion is a structural consistency checker, not a truth oracle.** It tells you whether the output is faithful to the source, not whether the source is correct.
 
 ## Every divergence is actionable
-
-Every divergence carries two fields inspired by structured diagnostics:
 
 ```python
 for d in result.divergences:
@@ -122,28 +145,10 @@ criterion verify source.txt output.txt --mode strict --json
 criterion batch pairs.jsonl --mode rag -o results.jsonl
 
 # Verify the append-only audit chain
-criterion chain
+criterion chain --record .criterion/record.jsonl
 ```
 
-Exit codes: `0` = trustworthy, `2` = untrustworthy. Use in CI:
-
-```bash
-criterion verify source.txt output.txt --quiet || echo "FAILED"
-```
-
-## CI / GitHub Actions
-
-Add to your workflow:
-
-```yaml
-- name: Install Criterion
-  run: pip install criterion-ai[semantic]
-
-- name: Verify AI outputs
-  run: criterion batch pairs.jsonl --mode rag -o results.jsonl
-```
-
-See `.github/workflows/criterion.yml` for a complete example.
+Exit codes: `0` = trustworthy, `2` = untrustworthy, `1` = error.
 
 ## Python API
 
@@ -153,15 +158,11 @@ import criterion
 # Single verification
 result = criterion.verify(source=src, output=out, mode="rag")
 
-# Batch verification
-results = criterion.verify_batch(
-    pairs=[(src1, out1), (src2, out2)],
-    mode="rag",
-)
+# Batch
+results = criterion.verify_batch(pairs=[(s1,o1), (s2,o2)], mode="rag")
 
 # JSON serialization
-import json
-print(json.dumps(result.to_dict(), indent=2))
+print(result.to_dict())
 
 # SARIF output for GitHub Code Scanning
 from criterion.github import write_sarif
@@ -170,34 +171,36 @@ write_sarif(results, "criterion.sarif")
 
 ## How it works
 
-Criterion decomposes text using an **Atom/Bond/Molecule** architecture:
+1. **Capture** — Decompose text into typed Atoms (claim, evidence, definition, reference, conclusion, metadata, observation), connected by typed Bonds (supports, contradicts, defines, cites, follows, elaborates, qualifies), composed into Molecules.
 
-1. **Capture** — Decompose source and output into typed semantic units (Atoms: claim, evidence, definition, reference, conclusion, metadata, observation), connected by typed relationships (Bonds: supports, contradicts, defines, cites, follows, elaborates, qualifies), composed into Molecules.
+2. **Divergence** — Align atoms by similarity. Run deterministic checks (numeric, negation, antonym) before similarity gates. Run NLI contradiction detection on aligned pairs. Classify into 8 divergence types × 4 severities.
 
-2. **Divergence** — Align source and output atoms by content similarity. Classify every difference by type (8 types) and severity (critical/major/minor/cosmetic). Detect broken bonds (evidence dropped while claims retained). Run numeric and negation checks before similarity gates.
+3. **Verdict** — Score trustworthiness with mode-specific filtering (RAG/summary/strict).
 
-3. **Verdict** — Score trustworthiness from divergence penalties with sublinear scaling. Classify as faithful (≥90%), adapted (≥70%), divergent (≥40%), or unreliable (<40%).
+4. **Record** — Append-only JSONL with content-hashed chain for tamper detection.
 
-4. **Record** — Preserve every verification in an append-only JSONL file with a hash chain, so the audit trail is tamper-evident.
+## Limitations
 
-## Benchmark results (v0.2.0)
+This is an alpha release that has been through four rounds of independent adversarial auditing. Known limitations:
 
-| Dataset | Type | Precision | Recall | F1 |
-|---------|------|-----------|--------|----|
-| HalluMix | Mixed hallucination | 57.6% | 70.7% | 63.4% |
-| HaluEval | QA hallucination | 50.2% | 77.3% | 60.9% |
-| GuardrailsAI | Factual errors in summaries | 49.9% | 97.0% | 65.9% |
-| SummEval | Summary consistency | 10.5% | 68.8% | 18.3% |
+- **NLI is optional but critical.** Without it, entity/relation/unit swaps pass undetected. Install with `[nli]`.
+- **NLI fallback is silent.** If the NLI model fails to load, Criterion falls back to heuristics without reporting the degradation in the result. A future release will add explicit capability reporting.
+- **Atom typing is heuristic.** Sentence splitting and claim/evidence classification use regex patterns, not a trained model. Complex documents may misclassify atoms.
+- **Alignment is greedy and quadratic.** O(n²) in atom count. Large documents (500+ sentences) may be slow. No chunking or truncation warning.
+- **Audit chain is not cryptographically signed.** The hash chain detects accidental modification but not a determined attacker who can recompute hashes. Concurrent writers can corrupt the chain.
+- **Not validated for autonomous trust decisions.** Use as a review assistant with human oversight, not as a sole gate for medical, legal, or financial content.
+- **English only.** All heuristic checks assume English text.
 
-Criterion achieves these results with **no ML training, no fine-tuning, and no API calls** — just structural decomposition, word-level heuristics, and a small sentence embedding model (all-MiniLM-L6-v2, 80MB).
+## Audit history
 
-SummEval's lower precision reflects the fundamental challenge of summarization: every summary omits and compresses, and distinguishing "valid compression" from "meaning-altering omission" requires deeper semantic understanding. The `summary` mode addresses this with more lenient thresholds.
+Criterion v0.2.0–v0.3.1 was independently audited by four AI systems across six rounds. The audits identified and drove fixes for: audit-chain integrity, RAG mode crashes, batch exit codes, empty input handling, currency extraction, NLI integration, antonym detection, numeric canonicalization, and mode-specific filtering policies. The auditors' consensus at v0.3.1: "experimental developer use: viable; controlled customer pilots: conditional; high-assurance commercial release: not approved."
 
 ## Requirements
 
 - Python ≥ 3.10
 - numpy
-- sentence-transformers (optional, for semantic similarity)
+- sentence-transformers (optional, `[semantic]`)
+- transformers + torch (optional, `[nli]` — strongly recommended)
 
 ## License
 
