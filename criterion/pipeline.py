@@ -45,8 +45,9 @@ def criterion(
             output_text="The contract expires in early 2027.",
         )
         print(verdict.summary)
-        # 1 divergence detected. Types: 1 concealing.
-        # Trust: adapted (77%).
+
+    This is the mode-less kernel. For RAG / summary / strict policies,
+    capability reporting and `require_nli`, use `criterion.verify`.
     """
     pair: CapturedPair = capture(source_text, output_text)
     report: DivergenceReport = find_divergences(pair)

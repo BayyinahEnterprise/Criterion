@@ -21,9 +21,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from criterion.capture import capture
-from criterion.divergence import find_divergences
-from criterion.verdict import render_verdict, TrustLevel
 
 
 @dataclass
@@ -78,12 +75,18 @@ class BenchResult:
         )
 
 
-def run_criterion_on_pair(source_text: str, output_text: str) -> bool:
-    """Run Criterion and return True if the output is flagged as divergent."""
-    pair = capture(source_text, output_text)
-    report = find_divergences(pair)
-    verdict = render_verdict(report)
-    return not verdict.is_trustworthy  # True = flagged as divergent
+def run_criterion_on_pair(source_text: str, output_text: str, mode: str = "rag") -> bool:
+    """Run Criterion and return True if the output is flagged as divergent.
+
+    Goes through the PUBLIC API (`criterion.verify`) in an explicit mode,
+    with NLI required, so the published numbers describe what a user who
+    calls `verify(..., mode=...)` actually gets. (Through v0.3.1 this
+    called the kernel pipeline directly, which no mode of the public API
+    reproduces, so the reported F1 did not describe the shipped product.)
+    """
+    from criterion.api import verify
+    result = verify(source_text, output_text, mode=mode, record=False, require_nli=True)
+    return not result.is_trustworthy  # True = flagged as divergent
 
 
 def bench_hallumix(limit: int = 0) -> BenchResult:
@@ -243,7 +246,7 @@ def bench_summeval(limit: int = 0) -> BenchResult:
             is_hallu = score < 3.0  # Low consistency = hallucinated
 
             try:
-                criterion_flag = run_criterion_on_pair(source, summary)
+                criterion_flag = run_criterion_on_pair(source, summary, mode="summary")
 
                 if criterion_flag and is_hallu:
                     tp += 1
@@ -382,14 +385,14 @@ def bench_guardrails(limit: int = 0) -> BenchResult:
                 continue
 
             # Reference summary should be faithful (not flagged)
-            ref_flag = run_criterion_on_pair(article, ref)
+            ref_flag = run_criterion_on_pair(article, ref, mode="summary")
             if not ref_flag:
                 tn += 1  # Correctly identified as faithful
             else:
                 fp += 1  # Incorrectly flagged faithful summary
 
             # Edited summary should be hallucinated (flagged)
-            edit_flag = run_criterion_on_pair(article, edited)
+            edit_flag = run_criterion_on_pair(article, edited, mode="summary")
             if edit_flag:
                 tp += 1  # Correctly caught hallucination
             else:

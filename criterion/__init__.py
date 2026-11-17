@@ -9,13 +9,14 @@ Quick start::
 
     result = criterion.verify(
         source="The contract expires on March 15, 2027.",
-        output="The contract expires in early 2027.",
+        output="The contract expires in early 2028.",
+        mode="strict",
     )
-    print(result.trust_level)   # "adapted"
-    print(result.trust_score)   # 0.77
-    print(result.is_trustworthy)  # True
+    print(result.trust_level)     # "divergent"
+    print(result.is_trustworthy)  # False — the date changed
+    print(result.capabilities)    # which detectors actually ran
     for d in result.divergences:
-        print(d.explanation)
+        print(d.code, d.explanation)
         print(d.suggested_correction)
 
 Modes::
@@ -36,14 +37,15 @@ Architecture (Furqan reading order):
     4. record     — preserve everything append-only with hash chain
 """
 
-__version__ = "0.3.1"
-
-from criterion.api import verify, VerifyResult, Mode
+from criterion._version import __version__
+from criterion.api import verify, verify_batch, VerifyResult, Mode, CapabilityError
 from criterion.verdict import TrustLevel
 from criterion.divergence import DivergenceType, Severity
 
 __all__ = [
     "verify",
+    "verify_batch",
+    "CapabilityError",
     "VerifyResult",
     "Mode",
     "TrustLevel",
