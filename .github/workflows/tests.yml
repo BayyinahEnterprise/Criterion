@@ -1,0 +1,47 @@
+# Criterion's own test suite.
+#
+# Two configurations, because they are two different products:
+#   core — heuristics only (no model). Model-dependent tests are skipped.
+#   full — with the NLI and embedding models, as users are told to install it.
+
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install (core only)
+        run: pip install . pytest
+      - name: Test
+        run: python -m pytest -q
+
+  full:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Cache models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ hashFiles('criterion/nli.py', 'criterion/semantic.py') }}
+      - name: Install (CPU PyTorch + all extras)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install ".[all]" pytest
+      - name: Test
+        run: python -m pytest -q

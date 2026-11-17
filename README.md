@@ -16,6 +16,12 @@ pip install "criterion-ai[nli]"         # NLI model only
 pip install criterion-ai                # heuristics only — see "Without the NLI model"
 ```
 
+`criterion-ai` is not on PyPI yet. Until it is published, install from this repository:
+
+```bash
+pip install "criterion-ai[all] @ git+https://github.com/BayyinahEnterprise/Criterion"
+```
+
 | Install | Adds | Catches |
 |---------|------|---------|
 | `criterion-ai` | ~2 MB | Changed numbers, currency ($1K→$2K), sign flips, negation inversion, prefix antonyms (safe→unsafe), role swaps, hidden characters, broken evidence bonds |
