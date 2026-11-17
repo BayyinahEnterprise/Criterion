@@ -425,3 +425,51 @@ class TestNumericCanonicalization:
         numeric_divs = [d for d in result.divergences
                        if "Numeric" in d.explanation or "numeric" in d.explanation.lower()]
         assert len(numeric_divs) == 0, "1,000 and 1000 should not be flagged as different"
+
+
+# ---------------------------------------------------------------------------
+# v0.2.3 — exact adversarial cases from fourth auditor retest
+# ---------------------------------------------------------------------------
+
+class TestAdversarialExact:
+    """These are the EXACT inputs from the fourth auditor's retest that
+    were still passing incorrectly in v0.2.2."""
+
+    def test_rag_unsupported_addition(self):
+        """RAG: unsupported addition 'great deal' must be untrustworthy."""
+        result = verify(
+            source="The contract expires on March 15.",
+            output="The contract expires on March 15. This is a great deal for everyone involved.",
+            mode="rag",
+        )
+        additions = [d for d in result.divergences if d.dtype == DivergenceType.ADDITION]
+        assert len(additions) >= 1, "Unsupported addition must be detected in RAG"
+
+    def test_strict_numeric_omission(self):
+        """Strict: 'March 15, 2027' → 'early 2027' must flag the dropped date."""
+        result = verify(
+            source="The contract expires on March 15, 2027.",
+            output="The contract expires in early 2027.",
+            mode="strict",
+        )
+        assert not result.is_trustworthy, "Dropping 'March 15' in strict mode must be untrustworthy"
+
+    def test_rag_concise_answer_not_false_positive(self):
+        """RAG: a correct concise answer should be trustworthy."""
+        result = verify(
+            source="The vaccine is safe. Because clinical trials with 40,000 participants showed no serious adverse effects.",
+            output="The vaccine is safe.",
+            mode="rag",
+        )
+        assert result.is_trustworthy, "A concise correct RAG answer should be trustworthy"
+
+    def test_summary_fabricated_claim_moon_cheese(self):
+        """Summary: fabricated content added to a summary must be caught."""
+        result = verify(
+            source="The earth is round. It orbits the sun. The sky is blue. Water is wet. Gravity exists.",
+            output="The sky is blue. The moon is made of cheese.",
+            mode="summary",
+        )
+        assert not result.is_trustworthy or any(
+            d.dtype == DivergenceType.ADDITION for d in result.divergences
+        ), "Fabricated 'moon is made of cheese' must be caught in summary mode"

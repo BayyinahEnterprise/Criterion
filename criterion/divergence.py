@@ -229,7 +229,7 @@ def _similarity(a: str, b: str) -> float:
 def _align_atoms(
     source: Sequence[Atom],
     output: Sequence[Atom],
-    threshold: float = 0.4,
+    threshold: float = 0.5,
 ) -> tuple[
     list[tuple[Atom, Atom, float]],
     list[Atom],
@@ -355,16 +355,10 @@ def _classify_matched_pair(
     # a factual fabrication. Embedding models miss this.
     src_numbers = _extract_numbers(source.text)
     out_numbers = _extract_numbers(output.text)
-    # Two cases to flag:
-    # 1. Output ADDS numbers not in source (fabrication)
-    # 2. Both sides have numbers but they differ (changed values)
-    # Do NOT flag when source has numbers the output simply omits
-    # (that's compression, handled by atom-level omission detector).
-    numbers_added = out_numbers - src_numbers
-    numbers_both_present_but_differ = (
-        src_numbers and out_numbers and not out_numbers.issubset(src_numbers)
-    )
-    if numbers_added or numbers_both_present_but_differ:
+    # Flag when numbers differ between source and output.
+    # Any symmetric difference = a numeric change worth reporting.
+    changed_numbers = src_numbers.symmetric_difference(out_numbers)
+    if changed_numbers and (src_numbers or out_numbers):
         return Divergence(
             dtype=DivergenceType.SURFACING,
             severity=Severity.CRITICAL,

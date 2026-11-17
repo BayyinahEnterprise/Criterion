@@ -215,7 +215,11 @@ def verify(
 
     # Apply mode-specific filtering
     filtered_divs = _apply_mode(verdict.divergences, resolved_mode)
-    filtered_bond_divs = verdict.bond_divergences
+    # In RAG mode, filter broken bonds from omissions (the answer is selective)
+    if resolved_mode == Mode.RAG:
+        filtered_bond_divs = ()  # RAG answers don't need all evidence
+    else:
+        filtered_bond_divs = verdict.bond_divergences
 
     # Imports for rescoring and record building
     from criterion.verdict import (
@@ -294,12 +298,30 @@ def _apply_mode(
 
     if mode == Mode.SUMMARY:
         # In summary mode, omissions and compression are expected.
-        # Only keep: additions (fabricated content), strengthening
-        # (overclaiming), and broken bonds (which come through separately).
+        # Keep: additions, strengthening, weakening, critical findings.
+        # Drop: omissions, minor compression/surfacing.
+        # Exception: numeric OMISSIONS (numbers dropped, not changed)
+        # are expected compression in summaries.
         result = []
         for d in divergences:
+            # Omissions are ALWAYS expected in summaries, even critical ones
             if d.dtype == DivergenceType.OMISSION:
-                # Downgrade all omissions to cosmetic in summary mode
+                continue
+            # Numeric omissions (numbers dropped, not changed) are compression
+            if d.severity == Severity.CRITICAL and "Numeric values changed" in d.explanation:
+                if "set()" in d.explanation:
+                    continue  # One side empty = number was dropped, not changed
+            # Keep critical findings (numeric changes, negation inversions, etc.)
+            if d.severity == Severity.CRITICAL:
+                result.append(d)
+                continue
+            # Keep strengthening/weakening — these change meaning
+            if d.dtype in (DivergenceType.STRENGTHENING, DivergenceType.WEAKENING):
+                result.append(d)
+                continue
+            # Keep major additions — these are fabrications
+            if d.dtype == DivergenceType.ADDITION and d.severity in (Severity.CRITICAL, Severity.MAJOR):
+                result.append(d)
                 continue
             if d.dtype in (DivergenceType.CONCEALING, DivergenceType.SURFACING):
                 if d.severity in (Severity.MINOR, Severity.COSMETIC):
@@ -316,12 +338,14 @@ def _apply_mode(
         # - Any CRITICAL divergence (numeric change, negation inversion)
         result = []
         for d in divergences:
-            # Always keep critical findings regardless of type
+            # RAG answers are SELECTIVE — omissions are always expected,
+            # even critical ones (the answer picks what's relevant)
+            if d.dtype == DivergenceType.OMISSION:
+                continue
+            # Keep critical non-omission findings (numeric changes, negation inversions)
             if d.severity == Severity.CRITICAL:
                 result.append(d)
                 continue
-            if d.dtype == DivergenceType.OMISSION:
-                continue  # Expected — answer is selective
             if d.dtype in (DivergenceType.CONCEALING, DivergenceType.DEFERRING):
                 continue  # Answer can compress and reorder
             if d.dtype == DivergenceType.SURFACING and d.severity in (Severity.MINOR, Severity.COSMETIC):
