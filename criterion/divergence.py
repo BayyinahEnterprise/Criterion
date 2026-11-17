@@ -204,6 +204,10 @@ class DivergenceReport:
     # Which detectors actually ran for THIS report. A missing or failed
     # model is recorded here instead of being silently swallowed.
     capabilities: dict[str, Any] = field(default_factory=dict)
+    # Output atom index -> best source support (NLI entailment, 0-1) for
+    # every output sentence NLI judged. Absent for fragments judged by
+    # containment and whenever NLI did not run.
+    support: dict[int, float] = field(default_factory=dict)
 
     @property
     def total(self) -> int:
@@ -821,6 +825,34 @@ EQUIVALENCE_THRESHOLD = 0.9
 # A single other atom must entail at >= this to re-align a matched pair.
 REALIGN_THRESHOLD = 0.8
 
+
+
+@dataclass(frozen=True)
+class Thresholds:
+    """The decision thresholds, as one object a caller can override.
+
+    grounded:       a sentence is supported when some source passage entails
+                    it at >= this. Raise it to demand stronger support (more
+                    flags); lower it to accept weaker support (fewer flags).
+    contradiction:  NLI contradiction must reach this to be reported.
+    fabrication:    below this best-support, an unsupported sentence is
+                    CRITICAL (blocks trust on its own) rather than MAJOR.
+                    This is the main precision/recall dial for RAG.
+    """
+
+    grounded: float = field(default_factory=lambda: GROUNDED_THRESHOLD)
+    contradiction: float = field(default_factory=lambda: CONTRADICTION_THRESHOLD)
+    fabrication: float = field(default_factory=lambda: FABRICATION_THRESHOLD)
+    equivalence: float = field(default_factory=lambda: EQUIVALENCE_THRESHOLD)
+    realign: float = field(default_factory=lambda: REALIGN_THRESHOLD)
+
+    def __post_init__(self) -> None:
+        for name in ("grounded", "contradiction", "fabrication", "equivalence", "realign"):
+            value = getattr(self, name)
+            if not isinstance(value, (int, float)) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"threshold {name} must be between 0 and 1, got {value!r}")
+
+
 _TOP_K_SINGLE = 3       # premises tried one at a time
 _TOP_K_JOINED = 5       # premises concatenated for multi-sentence support
 _PREMISE_WORD_BUDGET = 220  # keeps premise + hypothesis inside the 512-token window
@@ -863,7 +895,16 @@ def _rank_pool(hyp_texts: list[str], pool_texts: list[str]) -> list[list[int]]:
     return ranked
 
 
-def _ground(hypotheses: Sequence[Atom], pool: Sequence[Atom]) -> dict[int, _Grounding]:
+def _as_statement(question: str, answer: str) -> str:
+    """Turn a question and a fragment answer into something NLI can judge."""
+    return f'The answer to the question "{question.strip()}" is {answer.strip().rstrip(".")}.'
+
+
+def _ground(
+    hypotheses: Sequence[Atom],
+    pool: Sequence[Atom],
+    texts: dict[int, str] | None = None,
+) -> dict[int, _Grounding]:
     """Ask NLI whether each hypothesis atom is supported by the pool.
 
     Each hypothesis is tested against its most relevant pool atoms one at
@@ -873,7 +914,10 @@ def _ground(hypotheses: Sequence[Atom], pool: Sequence[Atom]) -> dict[int, _Grou
     """
     if not hypotheses or not pool:
         return {}
-    hyp_texts = [_clean(a.text) for a in hypotheses]
+    # `texts` overrides the hypothesis wording per atom index (used to phrase
+    # a fragment answer as a statement when the question is known).
+    texts = texts or {}
+    hyp_texts = [_clean(texts.get(a.index, a.text)) for a in hypotheses]
     pool_texts = [_clean(a.text) for a in pool]
     ranked = _rank_pool(hyp_texts, pool_texts)
 
@@ -984,9 +1028,11 @@ def _contradiction(source: Atom | None, output: Atom, confidence: float, code: s
     )
 
 
-def _unsupported(source: Atom | None, output: Atom, entailment: float) -> Divergence:
+def _unsupported(
+    source: Atom | None, output: Atom, entailment: float, fabrication: float,
+) -> Divergence:
     """An output claim that NLI finds no support for anywhere relevant in the source."""
-    fabricated = entailment < FABRICATION_THRESHOLD
+    fabricated = entailment < fabrication
     where = "within this sentence" if source is not None else "in this sentence"
     return Divergence(
         dtype=DivergenceType.ADDITION,
@@ -1011,7 +1057,13 @@ def _unsupported(source: Atom | None, output: Atom, entailment: float) -> Diverg
 _MODES = (None, "strict", "rag", "summary")
 
 
-def find_divergences(pair: CapturedPair, mode: str | None = None) -> DivergenceReport:
+def find_divergences(
+    pair: CapturedPair,
+    mode: str | None = None,
+    *,
+    thresholds: Thresholds | None = None,
+    question: str | None = None,
+) -> DivergenceReport:
     """Find all divergences between a captured source-output pair.
 
     This is the second step in Criterion. After capture, divergence.
@@ -1029,12 +1081,21 @@ def find_divergences(pair: CapturedPair, mode: str | None = None) -> DivergenceR
             None keeps the kernel's legacy behaviour, which infers
             summary leniency from the atom-count ratio.
 
+        thresholds: Decision thresholds; defaults to Thresholds().
+        question: The question the output answers, if any. With it, a
+            fragment answer ("Delhi") is turned into a statement and
+            judged by NLI instead of merely being located in the source.
+
     Returns:
-        A DivergenceReport with every divergence classified, plus a
-        `capabilities` dict naming the detectors that actually ran.
+        A DivergenceReport with every divergence classified, a
+        `capabilities` dict naming the detectors that actually ran, and
+        `support`: the best source support (0-1) NLI found for each
+        output sentence it judged.
     """
     if mode not in _MODES:
         raise ValueError(f"unknown mode {mode!r}; expected one of {_MODES}")
+    t = thresholds or Thresholds()
+    question = question.strip() if isinstance(question, str) and question.strip() else None
 
     source_atoms = pair.source.atoms
     output_atoms = pair.output.atoms
@@ -1045,6 +1106,21 @@ def find_divergences(pair: CapturedPair, mode: str | None = None) -> DivergenceR
     }
 
     matched, unmatched_src, unmatched_out = _align_atoms(source_atoms, output_atoms)
+    if question:
+        # A fragment answer must be judged against the question, not against
+        # whichever source sentence happens to contain its words: "Martin
+        # Scorsese" aligns with "Martin Scorsese produced it." however wrong
+        # an answer it is to "Who directed the film?".
+        kept = []
+        for src, out, sim in matched:
+            if _is_fragment(out.text):
+                unmatched_src.append(src)
+                unmatched_out.append(out)
+            else:
+                kept.append((src, out, sim))
+        matched = kept
+        unmatched_src.sort(key=lambda a: a.index)
+        unmatched_out.sort(key=lambda a: a.index)
 
     # Leniency comes from the mode, not from how long the output happens to be.
     total_source = len(source_atoms)
@@ -1084,20 +1160,36 @@ def find_divergences(pair: CapturedPair, mode: str | None = None) -> DivergenceR
     # Ground every output atom that alignment + pairwise NLI left unsettled:
     # unmatched output atoms, and matched ones their partner does not entail.
     fragments = {a.index for a in output_atoms if _is_fragment(a.text)}
+    # Fragments NLI cannot judge on their own. With the question, a fragment
+    # becomes a statement ("The answer to ... is Delhi.") and is judged.
+    unjudgeable = set() if question else fragments
+    statements = (
+        {a.index: _as_statement(question, a.text) for a in unmatched_out if a.index in fragments}
+        if question else {}
+    )
     grounding: dict[int, _Grounding] = {}
     if nli_ok:
-        need = [a for a in unmatched_out if a.index not in fragments] + [
+        need = [a for a in unmatched_out if a.index not in unjudgeable] + [
             out for (_, out, _), f in zip(matched, fwd)
-            if f.entailment < GROUNDED_THRESHOLD and out.index not in fragments
+            if f.entailment < t.grounded and out.index not in fragments
         ]
         try:
-            grounding = _ground(need, source_atoms)
+            grounding = _ground(need, source_atoms, statements)
         except Exception as e:
             nli_ok = False
             caps["nli_error"] = f"{type(e).__name__}: {e}"
     caps["nli"] = nli_ok
     if _USE_SEMANTIC and not caps["semantic"] and not caps["semantic_error"]:
         caps["semantic"] = True  # available; nothing needed encoding
+
+    # Best source support per judged output sentence (the groundedness score).
+    support: dict[int, float] = {}
+    if nli_ok:
+        for (_, out, _), f in zip(matched, fwd):
+            if f is not None and out.index not in fragments:
+                support[out.index] = f.entailment
+        for idx, g in grounding.items():
+            support[idx] = max(support.get(idx, 0.0), g.entailment)
 
     divergences: list[Divergence] = []
     covered_src: set[int] = {src.index for src, _, _ in matched}
@@ -1125,10 +1217,10 @@ def find_divergences(pair: CapturedPair, mode: str | None = None) -> DivergenceR
                 divergences.append(_downgrade_if_compressing(div))
             continue
 
-        if f.entailment >= GROUNDED_THRESHOLD:
+        if f.entailment >= t.grounded:
             equivalent = (
-                f.entailment >= EQUIVALENCE_THRESHOLD
-                and b.entailment >= EQUIVALENCE_THRESHOLD
+                f.entailment >= t.equivalence
+                and b.entailment >= t.equivalence
             )
             div = _classify_matched_pair(
                 src, out, sim, semantic_sim=sem_sims[i],
@@ -1137,7 +1229,7 @@ def find_divergences(pair: CapturedPair, mode: str | None = None) -> DivergenceR
             )
             if (
                 div is None and mode == "strict"
-                and b.entailment < GROUNDED_THRESHOLD
+                and b.entailment < t.grounded
                 and out.index not in fragments
             ):
                 # The source implies the output but not the reverse: the
@@ -1163,7 +1255,7 @@ def find_divergences(pair: CapturedPair, mode: str | None = None) -> DivergenceR
         other = g.entail_atom if g else None
         if (
             g is not None and other is not None and other.index != src.index
-            and g.entail_atom_score >= REALIGN_THRESHOLD
+            and g.entail_atom_score >= t.realign
         ):
             # Alignment picked the wrong partner: another source atom says
             # exactly this. Judge against that one; release the original.
@@ -1177,14 +1269,14 @@ def find_divergences(pair: CapturedPair, mode: str | None = None) -> DivergenceR
                 divergences.append(_downgrade_if_compressing(div))
             continue
 
-        if f.contradiction >= CONTRADICTION_THRESHOLD and f.label == "contradiction":
+        if f.contradiction >= t.contradiction and f.label == "contradiction":
             divergences.append(_contradiction(src, out, f.contradiction, "nli_contradiction"))
             continue
-        if g is not None and g.contradiction >= CONTRADICTION_THRESHOLD and g.contradiction > g.entailment:
+        if g is not None and g.contradiction >= t.contradiction and g.contradiction > g.entailment:
             divergences.append(_contradiction(g.contra_atom, out, g.contradiction, "contradicts_source"))
             continue
 
-        supported_elsewhere = g is not None and g.entailment >= GROUNDED_THRESHOLD
+        supported_elsewhere = g is not None and g.entailment >= t.grounded
         div = _classify_matched_pair(src, out, sim, semantic_sim=sem_sims[i])
         # A specific deterministic finding (changed number, flipped negation,
         # shifted hedge) explains the mismatch better than "unsupported".
@@ -1195,7 +1287,7 @@ def find_divergences(pair: CapturedPair, mode: str | None = None) -> DivergenceR
             or div.code in ("strengthening", "weakening")
         )
         if not specific and not supported_elsewhere:
-            div = _unsupported(src, out, g.entailment if g else f.entailment)
+            div = _unsupported(src, out, g.entailment if g else f.entailment, t.fabrication)
         if div is not None:
             divergences.append(_downgrade_if_compressing(div))
 
@@ -1203,7 +1295,7 @@ def find_divergences(pair: CapturedPair, mode: str | None = None) -> DivergenceR
     pending_additions: list[Atom] = []
     source_vocab: set[str] | None = None
     for atom in unmatched_out:
-        if nli_ok and atom.index in fragments:
+        if nli_ok and atom.index in unjudgeable:
             if source_vocab is None:
                 source_vocab = set(_words(pair.source.raw_text))
             div = _classify_fragment(atom, source_vocab)
@@ -1214,20 +1306,24 @@ def find_divergences(pair: CapturedPair, mode: str | None = None) -> DivergenceR
         if g is None:
             pending_additions.append(atom)   # no NLI: legacy handling below
             continue
-        if g.entailment >= GROUNDED_THRESHOLD:
+        if g.entailment >= t.grounded:
             # Some source passage supports this — a paraphrase that alignment
             # missed, not an addition. (Retrieved documents may disagree with
             # each other; support from any of them grounds the statement.)
             # The source atom it restates is therefore not an omission either.
-            if g.entail_atom is not None and g.entail_atom_score >= GROUNDED_THRESHOLD:
+            if g.entail_atom is not None and g.entail_atom_score >= t.grounded:
                 covered_src.add(g.entail_atom.index)
             continue
-        if g.contradiction >= CONTRADICTION_THRESHOLD:
+        if g.contradiction >= t.contradiction:
             divergences.append(_contradiction(g.contra_atom, atom, g.contradiction, "contradicts_source"))
             if g.contra_atom is not None:
                 covered_src.add(g.contra_atom.index)  # addressed (wrongly), not omitted
             continue
-        divergences.append(_unsupported(None, atom, g.entailment))
+        # A fragment judged through its question IS the whole answer, so an
+        # unsupported one blocks; an unsupported sentence among others only
+        # blocks when its support is below the fabrication threshold.
+        bar = t.grounded if atom.index in statements else t.fabrication
+        divergences.append(_unsupported(None, atom, g.entailment, bar))
 
     # Source atoms still unaccounted for. With NLI, check whether the output
     # states them somewhere alignment did not look (merged/reworded sentences).
@@ -1237,7 +1333,7 @@ def find_divergences(pair: CapturedPair, mode: str | None = None) -> DivergenceR
             reverse = _ground(omitted, output_atoms)
             omitted = [
                 a for a in omitted
-                if reverse[a.index].entailment < GROUNDED_THRESHOLD
+                if reverse[a.index].entailment < t.grounded
             ]
         except Exception as e:
             caps["nli_error"] = f"{type(e).__name__}: {e}"
@@ -1317,4 +1413,5 @@ def find_divergences(pair: CapturedPair, mode: str | None = None) -> DivergenceR
         source_atoms_unmatched=len(omitted),
         output_atoms_unmatched=len(unmatched_out),
         capabilities=caps,
+        support={k: round(v, 4) for k, v in sorted(support.items())},
     )

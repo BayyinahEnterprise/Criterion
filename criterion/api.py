@@ -31,6 +31,7 @@ from typing import Any, Sequence
 from criterion.capture import capture, CapturedPair
 from criterion.divergence import (
     find_divergences,
+    Thresholds,
     Divergence,
     BondDivergence,
     DivergenceReport,
@@ -104,6 +105,15 @@ class VerifyResult:
     # claims were NOT checked and a clean verdict means much less.
     capabilities: dict[str, Any] = field(default_factory=dict)
 
+    # Per output sentence NLI judged: {"text", "support"}; support is the
+    # best entailment (0-1) any relevant source passage gives that sentence.
+    sentence_support: tuple[dict[str, Any], ...] = ()
+    # The weakest sentence's support — one number to threshold or chart.
+    # None when NLI did not run or judged nothing (e.g. fragment answers).
+    groundedness: float | None = None
+    # The thresholds this verdict was decided with.
+    thresholds: dict[str, float] = field(default_factory=dict)
+
     def to_dict(self) -> dict:
         """Serialize to a dictionary for JSON output."""
         return {
@@ -119,6 +129,9 @@ class VerifyResult:
             "mode": self.mode,
             "record_id": self.record_id,
             "capabilities": dict(self.capabilities),
+            "groundedness": self.groundedness,
+            "sentence_support": list(self.sentence_support),
+            "thresholds": dict(self.thresholds),
             "divergences": [
                 {
                     "type": d.dtype.value,
@@ -168,6 +181,8 @@ def verify(
     *,
     require_nli: bool | None = None,
     store_text: bool = True,
+    thresholds: Thresholds | dict[str, float] | None = None,
+    question: str | None = None,
 ) -> VerifyResult:
     """Verify an AI-generated output against its source.
 
@@ -183,12 +198,17 @@ def verify(
         record_path: Path for the append-only record. Set record=False
                      to skip recording.
         record: Whether to write to the append-only record.
-        require_nli: If True, raise CapabilityError instead of returning
-                     a verdict when the NLI model did not run. Defaults
-                     to the CRITERION_REQUIRE_NLI environment variable.
-                     Use this for any automated gate: without NLI,
-                     Criterion cannot see contradictions or fabricated
-                     claims, and would otherwise degrade silently.
+        require_nli: Default True: raise CapabilityError when the NLI
+                     model did not run, because without it Criterion
+                     cannot see contradictions or fabricated claims.
+                     Pass False (or set CRITERION_REQUIRE_NLI=0) to run
+                     heuristics only; a clean result is then reported as
+                     "unverified" and is never trustworthy.
+        thresholds: A Thresholds object or a dict such as
+                    {"fabrication": 0.05}. `fabrication` is the main
+                    precision/recall dial: an unsupported sentence blocks
+                    trust on its own only when its best source support is
+                    below it. Higher flags more; lower flags less.
         store_text: If False, the record keeps only SHA-256 hashes of
                     source and output, not the texts (sensitive data).
 
@@ -225,7 +245,12 @@ def verify(
     if not isinstance(source, str) or not isinstance(output, str):
         raise TypeError("source and output must be strings")
     if require_nli is None:
-        require_nli = _env_flag("CRITERION_REQUIRE_NLI")
+        env = os.environ.get("CRITERION_REQUIRE_NLI", "").strip().lower()
+        require_nli = env not in ("0", "false", "no", "off")
+    if isinstance(thresholds, dict):
+        thresholds = Thresholds(**thresholds)
+    elif thresholds is None:
+        thresholds = Thresholds()
 
     # Resolve mode
     if mode is None or mode == "auto" or mode == Mode.AUTO:
@@ -255,13 +280,20 @@ def verify(
     # Run the pipeline. The mode is passed down so that detection leniency
     # is the caller's decision, never a side effect of the output's length.
     pair = capture(source, output)
-    report = find_divergences(pair, mode=resolved_mode.value)
+    if question is not None and not isinstance(question, str):
+        raise TypeError("question must be a string")
+    report = find_divergences(
+        pair, mode=resolved_mode.value, thresholds=thresholds, question=question,
+    )
     capabilities = dict(report.capabilities)
     if require_nli and not capabilities.get("nli"):
         raise CapabilityError(
-            "NLI was required but did not run "
-            f"({capabilities.get('nli_error') or 'unavailable'}). "
-            "Install with `pip install criterion-ai[nli]`."
+            "The NLI model did not run "
+            f"({capabilities.get('nli_error') or 'unavailable'}), so contradictions and "
+            "fabricated claims cannot be checked. Install it with "
+            "`pip install criterion-ai[nli]`, or pass require_nli=False "
+            "(CLI: --allow-degraded) to run heuristics only; clean results are "
+            "then reported as 'unverified'."
         )
     verdict = render_verdict(report)
 
@@ -295,10 +327,24 @@ def verify(
     maj = sum(1 for d in filtered_divs if d.severity == Severity.MAJOR)
     minor = sum(1 for d in filtered_divs if d.severity == Severity.MINOR)
     level = _classify_trust(score, crit, maj, len(filtered_bond_divs))
+    if not capabilities.get("nli") and level in (TrustLevel.FAITHFUL, TrustLevel.ADAPTED):
+        # Heuristics found nothing blocking, but the detector that looks for
+        # contradictions and fabrications never ran. That is not "faithful".
+        level = TrustLevel.UNVERIFIED
     is_trust = level in (TrustLevel.FAITHFUL, TrustLevel.ADAPTED)
     summary = _build_filtered_summary(level, score, filtered_divs, filtered_bond_divs)
     if not capabilities.get("nli"):
         summary += " [NLI did not run: contradictions and fabricated claims were not checked.]"
+    out_text = {a.index: a.text for a in pair.output.atoms}
+    sentence_support = tuple(
+        {"text": out_text[i], "support": sc} for i, sc in report.support.items() if i in out_text
+    )
+    groundedness = min((x["support"] for x in sentence_support), default=None)
+    threshold_dict = {
+        "grounded": thresholds.grounded, "contradiction": thresholds.contradiction,
+        "fabrication": thresholds.fabrication, "equivalence": thresholds.equivalence,
+        "realign": thresholds.realign,
+    }
 
     # Record — store the FILTERED verdict so record matches what was returned
     record_id = None
@@ -320,7 +366,7 @@ def verify(
         entry = preserve(
             pair, report, filtered_verdict, record_path,
             mode=resolved_mode.value,
-            detector_config=_detector_config(capabilities),
+            detector_config=_detector_config(capabilities, threshold_dict),
             store_text=store_text,
         )
         record_id = entry.entry_id
@@ -346,23 +392,22 @@ def verify(
         _report=report,
         _pair=pair,
         capabilities=capabilities,
+        sentence_support=sentence_support,
+        groundedness=groundedness,
+        thresholds=threshold_dict,
     )
 
 
-def _detector_config(capabilities: dict[str, Any]) -> dict[str, Any]:
+def _detector_config(
+    capabilities: dict[str, Any], thresholds: dict[str, float] | None = None,
+) -> dict[str, Any]:
     """What produced this verdict: detectors that ran, models, thresholds."""
-    from criterion import divergence as _d
     config: dict[str, Any] = {
         "nli": bool(capabilities.get("nli")),
         "semantic": bool(capabilities.get("semantic")),
         "nli_error": capabilities.get("nli_error"),
         "semantic_error": capabilities.get("semantic_error"),
-        "thresholds": {
-            "grounded": _d.GROUNDED_THRESHOLD,
-            "contradiction": _d.CONTRADICTION_THRESHOLD,
-            "fabrication": _d.FABRICATION_THRESHOLD,
-            "equivalence": _d.EQUIVALENCE_THRESHOLD,
-        },
+        "thresholds": dict(thresholds) if thresholds else None,
     }
     try:
         from criterion.nli import model_info as _nli_info

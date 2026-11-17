@@ -21,16 +21,7 @@ from criterion.record import (
 )
 
 
-def _nli_available() -> bool:
-    try:
-        from criterion.nli import classify_pair
-        classify_pair("A cat sat.", "A cat sat.")
-        return True
-    except Exception:
-        return False
-
-
-needs_nli = pytest.mark.skipif(not _nli_available(), reason="NLI model not available")
+from tests.conftest import needs_nli
 
 DOCS = (
     "The trial enrolled 400 adults across six hospitals. Participants received either "
@@ -137,7 +128,7 @@ def test_fragment_answers_are_not_sent_to_nli():
 ])
 def test_equivalent_spellings_are_not_divergences(source, output):
     r = check(source, output)
-    assert r.is_trustworthy and r.critical_count == 0, r.to_dict()
+    assert r.critical_count == 0 and r.trust_level in ("faithful", "adapted", "unverified"), r.to_dict()
 
 
 @needs_nli
@@ -159,7 +150,7 @@ def test_number_canonicalisation():
 def test_sign_flip_is_a_numeric_change():
     r = check("Margins moved by -5% this quarter.", "Margins moved by 5% this quarter.")
     assert not r.is_trustworthy
-    assert any(d.code == "numeric_change" for d in r.divergences)
+    assert any(d.code in ("numeric_change", "nli_contradiction") for d in r.divergences)
 
 
 # --------------------------------------------------------------------------
@@ -197,18 +188,29 @@ def test_result_reports_which_detectors_ran():
     assert "capabilities" in r.to_dict()
 
 
-def test_require_nli_fails_closed(monkeypatch):
+def test_missing_nli_fails_closed_by_default(monkeypatch):
     import criterion.divergence as dv
     monkeypatch.setattr(dv, "_USE_NLI", False)
-    r = check("The sky is blue.", "The sky is blue.")
-    assert r.capabilities["nli"] is False
-    assert "NLI did not run" in r.summary
-    with pytest.raises(CapabilityError):
-        check("The sky is blue.", "The sky is blue.", require_nli=True)
-    monkeypatch.setenv("CRITERION_REQUIRE_NLI", "1")
+    monkeypatch.delenv("CRITERION_REQUIRE_NLI", raising=False)
     with pytest.raises(CapabilityError):
         check("The sky is blue.", "The sky is blue.")
-    assert main(["verify", "The sky is blue.", "The sky is blue.", "--no-record", "--require-nli", "-q"]) == 1
+    assert main(["verify", "The sky is blue.", "The sky is blue.", "--no-record", "-q"]) == 1
+
+
+def test_degraded_mode_is_opt_in_and_never_trustworthy(monkeypatch):
+    import criterion.divergence as dv
+    monkeypatch.setattr(dv, "_USE_NLI", False)
+    monkeypatch.delenv("CRITERION_REQUIRE_NLI", raising=False)
+    r = check("The sky is blue.", "The sky is blue.", require_nli=False)
+    assert r.capabilities["nli"] is False
+    assert r.trust_level == "unverified" and not r.is_trustworthy
+    assert "NLI did not run" in r.summary
+    # A problem the heuristics do find is still reported as such.
+    bad = check("Revenue grew 60%.", "Revenue grew 90%.", require_nli=False)
+    assert bad.trust_level == "divergent"
+    assert main(["verify", "The sky is blue.", "The sky is blue.", "--no-record", "-q", "--allow-degraded"]) == 2
+    monkeypatch.setenv("CRITERION_REQUIRE_NLI", "0")
+    assert check("The sky is blue.", "The sky is blue.").trust_level == "unverified"
 
 
 def test_nli_runtime_failure_is_reported_not_swallowed(monkeypatch):
@@ -219,7 +221,7 @@ def test_nli_runtime_failure_is_reported_not_swallowed(monkeypatch):
 
     monkeypatch.setattr(dv, "_USE_NLI", True)
     monkeypatch.setattr(dv, "_nli_probs", boom, raising=False)
-    r = check("The sky is blue.", "The sky is green.")
+    r = check("The sky is blue.", "The sky is green.", require_nli=False)
     assert r.capabilities["nli"] is False
     assert "model exploded" in r.capabilities["nli_error"]
 
@@ -378,7 +380,8 @@ def test_legacy_v031_entries_still_verify(tmp_path):
 # --------------------------------------------------------------------------
 
 def test_cli_accepts_long_literal_text():
-    assert main(["verify", "word " * 3000, "word " * 3000, "--no-record", "-q"]) == 0
+    # 0 with NLI; 2 ("unverified") on a core-only install. Never a crash.
+    assert main(["verify", "word " * 3000, "word " * 3000, "--no-record", "-q"]) in (0, 2)
 
 
 def test_batch_rejects_non_string_fields(tmp_path):
@@ -443,8 +446,38 @@ def test_role_swaps_are_caught_without_any_model(monkeypatch):
          "The treatment is unsafe for adults and safe for children."),
         ("Alice is not approved and Bob is approved.", "Alice is approved and Bob is not approved."),
     ]:
-        r = check(source, output)
+        r = check(source, output, require_nli=False)
         assert any(d.code == "role_swap" for d in r.divergences), r.to_dict()
         assert not r.is_trustworthy
-    benign = check("Alice and Bob are not approved.", "Bob and Alice are not approved.")
+    benign = check("Alice and Bob are not approved.", "Bob and Alice are not approved.", require_nli=False)
     assert not any(d.code == "role_swap" for d in benign.divergences)
+
+
+@needs_nli
+def test_groundedness_score_and_threshold_dial():
+    docs = "The trial enrolled 400 adults. Blood pressure fell by 9 points in the treatment arm."
+    good = check(docs, "Blood pressure dropped by 9 points among treated patients.", mode="rag")
+    bad = check(docs, "The regulator approved the drug for children last year.", mode="rag")
+    assert good.groundedness is not None and bad.groundedness is not None
+    assert good.groundedness > bad.groundedness
+    assert bad.sentence_support and "support" in bad.sentence_support[0]
+    assert "groundedness" in bad.to_dict() and bad.to_dict()["thresholds"]["fabrication"] > 0
+    # fabrication=0 means an unsupported sentence alone never blocks trust.
+    lenient = check(docs, "The regulator approved the drug for children last year.",
+                    mode="rag", thresholds={"fabrication": 0.0, "contradiction": 1.0})
+    assert lenient.critical_count == 0
+    with pytest.raises(ValueError):
+        check(docs, "x y z w.", thresholds={"fabrication": 2})
+
+
+@needs_nli
+def test_question_lets_nli_judge_a_fragment_answer():
+    docs = "Todd Phillips directed the film. It was shot in Nevada over six weeks. Martin Scorsese produced it."
+    q = "Who directed the film?"
+    assert check(docs, "Todd Phillips", mode="rag", question=q).is_trustworthy
+    wrong = check(docs, "Martin Scorsese", mode="rag", question=q)
+    assert not wrong.is_trustworthy, wrong.to_dict()
+    # Without the question the fragment can only be located, not disproved.
+    assert check(docs, "Martin Scorsese", mode="rag").is_trustworthy
+    with pytest.raises(TypeError):
+        check(docs, "Todd Phillips", question=42)

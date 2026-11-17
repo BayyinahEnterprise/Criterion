@@ -7,8 +7,14 @@ numeric role swaps, entity substitutions, relation reversals,
 inflected antonyms, and all cases where wording is similar but
 meaning is reversed.
 
-Uses cross-encoder/nli-deberta-v3-small (140MB) — classifies
-each atom pair as entailment, contradiction, or neutral.
+Uses tasksource/deberta-base-long-nli (Apache-2.0, ~740 MB) — classifies
+each pair as entailment, contradiction, or neutral. It was chosen over
+the previous default, cross-encoder/nli-deberta-v3-small, by measurement:
+on HalluMix it halves the rate of faithful answers flagged, its scores
+are graded rather than saturated at 0/1 (so thresholds actually move the
+trade-off), and it can judge a fragment answer phrased with its question.
+The small model remains available:
+    CRITERION_NLI_MODEL=cross-encoder/nli-deberta-v3-small
 
 Architecture:
     - Lazy model loading (first call loads, subsequent calls reuse)
@@ -30,19 +36,22 @@ from typing import NamedTuple, Sequence
 # This allows the module to be imported even without torch installed,
 # so _USE_NLI in divergence.py can be set correctly and degrade gracefully.
 
-_DEFAULT_NLI_MODEL = "cross-encoder/nli-deberta-v3-small"
-_DEFAULT_NLI_REVISION = "fa2804872c3b4bd748f38c0185cc85775361e735"
+_DEFAULT_NLI_MODEL = "tasksource/deberta-base-long-nli"
+_DEFAULT_NLI_REVISION = "04dcf11f844b07bc57015169fca2b7d6df8299d5"
+# Known-good revisions for models Criterion has been measured with. Any
+# other model is unpinned unless CRITERION_NLI_REVISION is set.
+_KNOWN_REVISIONS = {
+    _DEFAULT_NLI_MODEL: _DEFAULT_NLI_REVISION,
+    "cross-encoder/nli-deberta-v3-small": "fa2804872c3b4bd748f38c0185cc85775361e735",
+}
 
 _NLI_MODEL_NAME = os.environ.get("CRITERION_NLI_MODEL", _DEFAULT_NLI_MODEL)
-# The pinned revision only applies to the default model. A custom model
-# is unpinned unless CRITERION_NLI_REVISION is set.
 _NLI_REVISION = os.environ.get(
-    "CRITERION_NLI_REVISION",
-    _DEFAULT_NLI_REVISION if _NLI_MODEL_NAME == _DEFAULT_NLI_MODEL else "",
+    "CRITERION_NLI_REVISION", _KNOWN_REVISIONS.get(_NLI_MODEL_NAME, ""),
 ) or None
 
-# Fallback label order (the default model's). The real order is read from
-# the loaded model's config — see _resolve_label_index.
+# The three classes. Their ORDER in the logits differs between checkpoints
+# and is always read from the loaded model's config (_resolve_label_index).
 _LABELS = ["contradiction", "entailment", "neutral"]
 
 _model = None
@@ -86,8 +95,6 @@ def _resolve_label_index(model) -> dict[str, int]:
                 index[canonical] = int(idx)
     if set(index) == set(_LABELS) and len(set(index.values())) == 3:
         return index
-    if _NLI_MODEL_NAME == _DEFAULT_NLI_MODEL:
-        return {name: i for i, name in enumerate(_LABELS)}
     raise RuntimeError(
         f"NLI model {_NLI_MODEL_NAME!r} does not expose "
         f"contradiction/entailment/neutral labels (id2label={id2label!r})"
@@ -139,7 +146,9 @@ def classify_batch_probs(
 
     import torch
     model, tokenizer = _load_nli()
-    li = _label_index or {name: i for i, name in enumerate(_LABELS)}
+    li = _label_index
+    if li is None:
+        raise RuntimeError("NLI label order was not resolved")
     results: list[NLIProbs] = []
 
     for i in range(0, len(premises), batch_size):

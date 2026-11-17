@@ -36,14 +36,33 @@ def _read_file_or_text(path_or_text: str) -> str:
 
 def _add_policy_flags(sub_parser) -> None:
     sub_parser.add_argument(
+        "--allow-degraded", action="store_true",
+        help="Run heuristics only if the NLI model is unavailable. Clean results are then "
+             "'unverified' (exit 2), never trustworthy. Without this flag a missing model is an error.",
+    )
+    sub_parser.add_argument(
         "--require-nli", action="store_true",
-        help="Fail (exit 1) instead of silently degrading if the NLI model cannot run. "
-             "Recommended for CI gates.",
+        help="(Default behaviour; kept for compatibility.) Fail if the NLI model cannot run.",
+    )
+    sub_parser.add_argument(
+        "--fabrication-threshold", type=float, default=None, metavar="0-1",
+        help="An unsupported sentence blocks trust on its own when its best source support is "
+             "below this. Higher flags more, lower flags less.",
     )
     sub_parser.add_argument(
         "--no-store-text", action="store_true",
         help="Record only SHA-256 hashes of source/output, not the texts.",
     )
+
+
+def _policy_kwargs(args) -> dict:
+    kwargs = {
+        "require_nli": False if args.allow_degraded else (True if args.require_nli else None),
+        "store_text": not args.no_store_text,
+    }
+    if args.fabrication_threshold is not None:
+        kwargs["thresholds"] = {"fabrication": args.fabrication_threshold}
+    return kwargs
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -103,8 +122,7 @@ def main(argv: list[str] | None = None) -> int:
                 mode=args.mode,
                 record_path=args.record,
                 record=not args.no_record,
-                require_nli=args.require_nli or None,
-                store_text=not args.no_store_text,
+                **_policy_kwargs(args),
             )
         except (CapabilityError, RecordCorruptError, InputTooLargeError) as e:
             print(f"Error: {e}", file=sys.stderr)
@@ -146,9 +164,11 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _print_human(result) -> None:
-    sym = {"faithful": "✓", "adapted": "~", "divergent": "!", "unreliable": "✗"}.get(result.trust_level, "?")
+    sym = {"faithful": "✓", "adapted": "~", "divergent": "!", "unreliable": "✗", "unverified": "?"}.get(result.trust_level, "?")
     print(f"\n  {sym} {result.trust_level.upper()} — {result.trust_score:.0%} trust  [mode: {result.mode}]\n")
     print(f"  {result.summary}\n")
+    if result.groundedness is not None:
+        print(f"  Groundedness (weakest sentence's source support): {result.groundedness:.2f}\n")
     caps = result.capabilities
     if caps and not caps.get("nli"):
         print(f"  ⚠ NLI did not run ({caps.get('nli_error') or 'unavailable'}).")
@@ -207,8 +227,7 @@ def _run_batch(args) -> int:
                     mode=args.mode,
                     record_path=args.record,
                     record=not args.no_record,
-                    require_nli=args.require_nli or None,
-                    store_text=not args.no_store_text,
+                    **_policy_kwargs(args),
                 )
                 results.append(result.to_dict())
             except (CapabilityError, RecordCorruptError) as e:

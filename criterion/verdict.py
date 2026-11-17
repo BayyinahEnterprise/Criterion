@@ -37,6 +37,9 @@ class TrustLevel(Enum):
     ADAPTED = "adapted"
     DIVERGENT = "divergent"
     UNRELIABLE = "unreliable"
+    # No problem was found, but the NLI model did not run, so contradictions
+    # and fabricated claims were never checked. Never counts as trustworthy.
+    UNVERIFIED = "unverified"
 
 
 # ---------------------------------------------------------------------------

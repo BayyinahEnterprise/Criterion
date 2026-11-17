@@ -4,6 +4,15 @@
 
 Every item below was reproduced against v0.3.1 first and is pinned by a test in `tests/test_redteam.py`.
 
+### Decisions taken after comparing with other groundedness checkers
+
+- **Fails closed.** `require_nli` now defaults to on: a missing or failing NLI model raises `CapabilityError`. Heuristics-only is an explicit opt-in (`require_nli=False`, `CRITERION_REQUIRE_NLI=0`, `--allow-degraded`), and its best verdict is the new level `unverified`, which is never `is_trustworthy`.
+- **Default NLI model is now `tasksource/deberta-base-long-nli`** (Apache-2.0, pinned). On held-out HalluMix the share of faithful answers flagged fell from 42% to 19% while recall went from 94% to 89%; on HaluEval recall fell from 72% to 60%. The old model's scores saturate at 0/1, so no threshold tried brought its false alarms below a third.
+- **A groundedness score and caller-set thresholds.** `VerifyResult.groundedness`, `.sentence_support`, `.thresholds`; `verify(thresholds={...})`; `--fabrication-threshold`. Thresholds used are stored in each record's `detector_config`.
+- **`question=`** on `verify()`: a fragment answer is judged as an answer to the question instead of merely being located in the source. Partial: about 45% of wrong-entity fragments caught in a synthetic test, against 0% without it.
+- Known regression from the model change: "365 days" → "about a year" is scored as a contradiction (`tests/test_nli.py::test_faithful_numeric_paraphrase`, marked xfail).
+- README stated the old NLI model was 140 MB; its weights are ~570 MB.
+
 ### Detection
 
 - **An explicit mode is no longer relaxed by a short output.** `find_divergences` inferred "this is a summary" from the sentence-count ratio regardless of the mode passed to `verify`. In `strict` mode, dropping five of six sentences returned *adapted / trustworthy*; in `rag` mode — where answers are always shorter than the documents — every fabricated sentence was downgraded to MINOR and a wholly invented answer scored *faithful (94%)*. The mode is now passed down and decides leniency.
@@ -20,7 +29,6 @@ Every item below was reproduced against v0.3.1 first and is pinned by a test in 
 ### Honesty about what ran
 
 - `VerifyResult.capabilities`, `to_dict()["capabilities"]` and the record's `detector_config` state whether NLI and embeddings actually ran, with the error if not. Model failures were previously swallowed by `except Exception: pass`.
-- `require_nli=True` / `CRITERION_REQUIRE_NLI=1` / `--require-nli` turn a missing NLI model into an error (`CapabilityError`).
 - The NLI label order is read from the model's config. It was hard-coded, so a `CRITERION_NLI_MODEL` with a different order silently swapped entailment and neutral.
 - Default models are pinned to Hub revisions.
 - One version string (`criterion/_version.py`). Records claimed `0.2.2`, captures `0.2.0`, SARIF `0.2.0`, the package `0.3.1`.
@@ -46,6 +54,8 @@ Every item below was reproduced against v0.3.1 first and is pinned by a test in 
 
 ### Behaviour changes to be aware of
 
-- RAG and strict verdicts are stricter. On HalluMix the share of faithful answers flagged rose from 4% to 42% (see README, Benchmarks).
+- RAG and strict verdicts are stricter than v0.3.1. On held-out HalluMix the share of faithful answers flagged is 19% (4% in v0.3.1, which caught 13% of hallucinations against 89% now).
+- A core-only install (`pip install criterion-ai`) raises `CapabilityError` from `verify()` unless degraded mode is requested.
+- The NLI model download is larger (~740 MB) and inference is slower (about one second per answer on two CPU cores).
 - `verify()` raises `TypeError` for non-string input, `RecordCorruptError` for a corrupt ledger tail, and `InputTooLargeError` past the comparison budget.
 - With `mode=None`, `find_divergences` keeps its legacy length-based leniency (used by `criterion.pipeline`).

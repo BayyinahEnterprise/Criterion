@@ -11,20 +11,22 @@ No API keys. No external services. Runs locally.
 ## Install
 
 ```bash
-pip install criterion-ai                # core: numeric, negation, structural checks
-pip install criterion-ai[nli]           # + NLI contradiction detection (recommended)
-pip install criterion-ai[all]           # + NLI + sentence embeddings
+pip install "criterion-ai[all]"         # recommended: NLI model + sentence embeddings
+pip install "criterion-ai[nli]"         # NLI model only
+pip install criterion-ai                # heuristics only — see "Without the NLI model"
 ```
 
-**Which install do you need?**
-
-| Install | Size | Catches |
+| Install | Adds | Catches |
 |---------|------|---------|
-| `criterion-ai` | ~2 MB | Changed numbers, currency ($1K→$2K), negation inversion, prefix antonyms (safe→unsafe), broken evidence bonds, additions, omissions |
-| `criterion-ai[nli]` | ~500 MB | Everything above **plus** entity swaps (Alice→Bob), relation reversals (sold-to→bought-from), predicate swaps, inflected antonyms (increased→decreased), unit changes (mg→g), location substitution |
-| `criterion-ai[all]` | ~600 MB | Everything above + sentence-embedding similarity for paraphrase detection |
+| `criterion-ai` | ~2 MB | Changed numbers, currency ($1K→$2K), sign flips, negation inversion, prefix antonyms (safe→unsafe), role swaps, hidden characters, broken evidence bonds |
+| `criterion-ai[nli]` | PyTorch + a ~740 MB model downloaded on first use | Everything above **plus** contradictions in any wording, fabricated sentences and clauses, entity swaps (Alice→Bob), relation reversals, unit changes (mg→g), location substitution |
+| `criterion-ai[all]` | + an ~90 MB embedding model | Everything above + better passage retrieval for grounding and paraphrase recognition |
 
-**The `[nli]` install is strongly recommended.** Without it, Criterion cannot detect meaning-level contradictions where the words are similar but the facts are reversed.
+### Without the NLI model
+
+Criterion **fails closed**. If the NLI model is not installed or cannot load, `verify()` raises `CapabilityError`, because without it contradictions and fabricated claims are never checked — and that is the job.
+
+To run the heuristics alone, opt in: `require_nli=False`, `CRITERION_REQUIRE_NLI=0`, or `--allow-degraded`. A problem the heuristics find is still reported as `divergent` / `unreliable`. A clean result is reported as **`unverified`**, which is never `is_trustworthy`: heuristics can find a problem, they cannot clear an output.
 
 ## Quick start
 
@@ -43,7 +45,22 @@ print(result.summary)            # "2 divergences detected. 1 critical. 1 broken
 print(result.capabilities)       # {"nli": True, "semantic": True, ...} — which detectors actually ran
 ```
 
-**Check `result.capabilities["nli"]`.** If it is `False`, contradictions and fabricated claims were not checked and a clean verdict means much less. For any automated gate, pass `require_nli=True` (or set `CRITERION_REQUIRE_NLI=1`, or `--require-nli` on the CLI) so a missing model is an error instead of a quiet downgrade.
+`result.capabilities` and the record's `detector_config` state which detectors and model revisions produced each verdict.
+
+### Groundedness score and thresholds
+
+```python
+result.groundedness        # 0-1: the weakest output sentence's support in the source
+result.sentence_support    # ({"text": ..., "support": 0.97}, ...) one per judged sentence
+result.thresholds          # the thresholds this verdict used
+
+# Tune the trade-off: fewer false alarms ...
+criterion.verify(source=docs, output=answer, mode="rag", thresholds={"fabrication": 0.05})
+# ... or catch more
+criterion.verify(source=docs, output=answer, mode="rag", thresholds={"fabrication": 0.5})
+```
+
+`fabrication` is the main dial: an unsupported sentence blocks trust on its own only when its best source support is below it (default 0.2). `grounded` (default 0.5) is the support a sentence needs to count as supported at all; `contradiction` (default 0.7) is the confidence a contradiction needs. On the CLI: `--fabrication-threshold`. The Benchmarks section shows what the dial buys.
 
 ## Three modes for three jobs
 
@@ -57,7 +74,14 @@ result = criterion.verify(source=retrieved_docs, output=llm_answer, mode="rag")
 
 RAG mode is strict on **additions** (fabricated content) and **strengthening** (overclaiming), lenient on omissions — the answer doesn't need to repeat everything. With NLI installed, every answer sentence is checked for support against the most relevant source passages: unsupported sentences are flagged, sentences a passage contradicts are critical, and paraphrases the aligner missed are recognised as supported.
 
-Bare fragment answers (`"Delhi"`, `"yes"`) are not statements, so they cannot be verified against a source without the question. Criterion checks only that a fragment's words occur in the source. Pass full-sentence answers for a real check.
+**Pass the question when the answer is a fragment.** A bare `"Delhi"` or `"yes"` is not a statement; on its own Criterion can only check that its words occur in the source, so a wrong name that the source happens to mention passes. With the question, the fragment is judged as an answer:
+
+```python
+criterion.verify(source=retrieved_docs, output="Martin Scorsese", mode="rag",
+                 question="Who directed the film?")
+```
+
+This is a partial fix, not a solved problem — see Benchmarks.
 
 ### Summary verification
 
@@ -127,10 +151,11 @@ Without the NLI model installed, Criterion **cannot detect**:
 - Inflected antonyms (increased → decreased) — not in the static antonym table
 - Unit/currency unit changes ($100 → €100) — symbols are stripped for numeric comparison
 
-These require the NLI model, which classifies sentence pairs as entailment, contradiction, or neutral using a 140MB DeBERTa model.
+These require the NLI model, which classifies sentence pairs as entailment, contradiction, or neutral. The default is `tasksource/deberta-base-long-nli` (Apache-2.0, ~740 MB, pinned to a fixed revision).
 
 **Even with NLI, Criterion does not catch:**
-- Fragment answers that name something the source mentions but that is the wrong answer to the question (the question is not an input)
+- About half of wrong fragment answers that name something the source mentions, even with `question=` (and all of them without it)
+- Equivalences that need world knowledge: the default model scores "365 days" → "about a year" as a contradiction
 - Support that only emerges from more than about five source sentences taken together (such a sentence is reported as unsupported — a false positive)
 - Factual errors that require world knowledge (the source itself may be wrong)
 - Multi-sentence reasoning chains where the contradiction emerges from combining claims
@@ -169,14 +194,18 @@ criterion batch pairs.jsonl --mode rag -o results.jsonl
 criterion chain --record .criterion/record.jsonl
 criterion chain --record .criterion/record.jsonl --expect-head <id> --expect-count <n>
 
-# CI gate: explicit mode, fail if the NLI model cannot run
-criterion batch pairs.jsonl --mode rag --require-nli -o results.jsonl
+# CI gate: explicit mode (a missing NLI model is an error by default)
+criterion batch pairs.jsonl --mode rag -o results.jsonl
+
+# Fewer false alarms / heuristics only
+criterion verify source.txt output.txt --mode rag --fabrication-threshold 0.05
+criterion verify source.txt output.txt --allow-degraded
 
 # Keep hashes only (no source/output text on disk)
 criterion verify source.txt output.txt --no-store-text
 ```
 
-Exit codes: `0` = trustworthy, `2` = untrustworthy, `1` = error.
+Exit codes: `0` = trustworthy, `2` = untrustworthy or unverified, `1` = error (including a missing NLI model).
 
 ## Python API
 
@@ -221,25 +250,37 @@ Each entry records the mode, the Criterion version that wrote it, and a `detecto
 
 ## Benchmarks
 
-Measured through the public API, `criterion.verify(source, answer, mode="rag")`, with `[all]` installed. "Flagged" means `is_trustworthy == False`. Rows 300–599 of each dataset (300 pairs each); rows 0–299 were looked at while building v0.4.0 and are not reported.
+Measured through the public API, `criterion.verify(source, answer, mode="rag")`, with `[all]` installed and default thresholds. "Flagged" means `is_trustworthy == False`. Each row is 300 pairs that were not used for any design or tuning decision: HaluEval QA rows 300–599, and from HalluMix rows 600–1,199 the first 300 pairs whose source is under 6,000 characters.
 
 | Dataset | Version | Precision | Recall | F1 | Faithful answers flagged |
 |---------|---------|-----------|--------|----|--------------------------|
-| HaluEval QA | 0.3.1 | 85.7% | 7.7% | 14.2% | 2 / 145 |
-| HaluEval QA | 0.4.0 | 96.5% | 71.6% | 82.2% | 4 / 145 |
 | HalluMix | 0.3.1 | 86.7% | 13.1% | 22.8% | 4 / 102 |
-| HalluMix | 0.4.0 | 81.3% | 94.4% | 87.4% | 43 / 102 |
+| HalluMix | 0.4.0 | 90.3% | 89.4% | 89.8% | 19 / 102 |
+| HaluEval QA | 0.3.1 | 85.7% | 7.7% | 14.2% | 2 / 145 |
+| HaluEval QA | 0.4.0 | 96.9% | 60.0% | 74.1% | 3 / 145 |
 
-Read these with care: 300 pairs per dataset is a small sample; HaluEval answers are fragments, which Criterion can only locate in the source, not verify; and on HalluMix the gain in recall is paid for with false alarms on 42% of faithful answers. Figures quoted for v0.2–v0.3.1 came from the mode-less kernel pipeline rather than `verify()`, and are not comparable. Reproduce with `python bench/run_benchmark.py`, which now calls the public API.
+**What the threshold dial buys** (HalluMix, a separate 300-pair development slice):
+
+| `fabrication` | Hallucinations caught | Faithful answers flagged |
+|---------------|-----------------------|--------------------------|
+| 0.05 | 82% | 14% |
+| 0.2 (default) | 86% | 17% |
+| 0.5 | 92% | 25% |
+
+**Why the default model changed.** With the previous model (`cross-encoder/nli-deberta-v3-small`) the same pipeline caught 94% of HalluMix hallucinations but flagged 42% of faithful answers, and no threshold setting tried moved that below a third: its scores sit at 0 or 1. The current default is graded, so the dial works. The cost is on HaluEval, where recall fell from 72% to 60%, and a larger download (~740 MB against ~570 MB).
+
+**Fragment answers and `question=`.** In a synthetic test (150 HaluEval questions whose correct answer is a fragment, each also paired with a different name taken from the same source), without the question every wrong name passed; with it 45% of wrong names were flagged, at the cost of flagging 9% of correct answers. Useful, far from solved.
+
+Read all of this with care: 300 pairs per dataset is a small sample; none of it is LLM-AggreFact, the benchmark the field reports, which is gated and has not been run; and figures quoted for v0.2–v0.3.1 came from the mode-less kernel pipeline rather than `verify()`, so they are not comparable. Reproduce with `python bench/run_benchmark.py`, which now calls the public API.
 
 ## Limitations
 
 This is an alpha release that has been through four rounds of independent adversarial auditing. Known limitations:
 
 - **NLI is optional but critical.** Without it, entity/relation/unit swaps pass undetected. Install with `[nli]`.
-- **NLI fallback is reported, not blocked, by default.** If the NLI model is missing or fails, `result.capabilities["nli"]` is `False` and the summary says so, but `is_trustworthy` can still be `True`. Use `require_nli=True` to make it an error.
-- **Grounding costs precision.** Sentence-level NLI flags some faithful answers as unsupported (see Benchmarks). The thresholds are constants in `criterion/divergence.py`.
-- **NLI model limits.** A 140 MB model is weak on arithmetic, long sentences (inputs are truncated at 512 tokens) and domain jargon, and can be fooled by adversarial phrasing.
+- **Grounding still raises false alarms.** Sentence-level NLI flags some faithful answers as unsupported (see Benchmarks). Tune with `thresholds=`.
+- **NLI model limits.** The default model has no world or unit knowledge, is weak on arithmetic and domain jargon, truncates inputs at 512 tokens, and can be fooled by adversarial phrasing. It runs at roughly one second per answer on two CPU cores.
+- **Not measured on LLM-AggreFact.** That is the benchmark the field reports; the dataset is gated and has not been run. Numbers here are not comparable to leaderboard figures.
 - **Atom typing is heuristic.** Sentence splitting and claim/evidence classification use regex patterns, not a trained model. Complex documents may misclassify atoms.
 - **Alignment is quadratic in rewritten sentences.** Verbatim sentences align in linear time; the rest are compared pairwise. Past 1,000,000 comparisons (about 1,000 × 1,000 rewritten sentences) Criterion raises `InputTooLargeError` instead of hanging — verify long documents in sections or raise `CRITERION_MAX_COMPARISONS`.
 - **Audit chain is symmetric-keyed at best.** There are no public-key signatures or built-in external anchoring; see "The record: what it proves".
