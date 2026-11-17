@@ -7,8 +7,20 @@ These are the exact adversarial cases from the GPT-6 red-team audit,
 the fourth auditor's retest, and the Kimi red-team report.
 """
 
+import pytest
+
 from criterion.api import verify
 from criterion.divergence import DivergenceType, Severity
+
+# Skip all NLI tests if torch/transformers not installed
+try:
+    import torch
+    import transformers
+    _HAS_NLI = True
+except ImportError:
+    _HAS_NLI = False
+
+pytestmark = pytest.mark.skipif(not _HAS_NLI, reason="NLI requires torch and transformers")
 
 
 class TestNLIContradictions:

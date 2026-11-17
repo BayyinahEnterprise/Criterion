@@ -203,6 +203,8 @@ def verify(
     # Empty input invariants — a trust layer cannot call empty output "faithful"
     source_empty = not source or not source.strip()
     output_empty = not output or not output.strip()
+    if source_empty and output_empty:
+        return _invalid_input_result(resolved_mode, "Both source and output are empty")
     if output_empty and not source_empty:
         return _empty_output_result(resolved_mode, record, record_path, source, output)
     if source_empty and not output_empty:
@@ -435,6 +437,28 @@ def _ungrounded_output_result(mode, do_record, record_path, source, output) -> V
         major_count=0,
         minor_count=0,
         summary="Source is empty. Output cannot be verified as grounded.",
+        corrections=(),
+        mode=mode.value,
+        record_id=None,
+        _verdict=None,
+        _report=None,
+        _pair=None,
+    )
+
+
+def _invalid_input_result(mode, reason: str) -> VerifyResult:
+    """Both inputs invalid — cannot verify."""
+    return VerifyResult(
+        trust_score=0.0,
+        trust_level="unreliable",
+        is_trustworthy=False,
+        divergences=(),
+        broken_bonds=(),
+        total_divergences=0,
+        critical_count=0,
+        major_count=0,
+        minor_count=0,
+        summary=reason,
         corrections=(),
         mode=mode.value,
         record_id=None,

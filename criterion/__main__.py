@@ -148,15 +148,26 @@ def _run_batch(args) -> int:
                 continue
             try:
                 obj = json.loads(line)
+                source = obj.get("source", "")
+                output = obj.get("output", "")
+                # Reject empty/missing source or output
+                if not source or not output:
+                    results.append({"error": "missing source or output", "line": line_num})
+                    continue
                 result = verify(
-                    source=obj.get("source", ""),
-                    output=obj.get("output", ""),
+                    source=source,
+                    output=output,
                     mode=args.mode,
                     record=not args.no_record,
                 )
                 results.append(result.to_dict())
             except Exception as e:
                 results.append({"error": str(e), "line": line_num})
+
+    # Reject empty batches
+    if not results:
+        print("Error: batch file is empty or contains no valid entries", file=sys.stderr)
+        return 1
 
     output_path = args.output or str(input_path.with_suffix(".results.jsonl"))
     with open(output_path, "w") as f:

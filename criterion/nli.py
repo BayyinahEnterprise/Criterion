@@ -22,7 +22,9 @@ from __future__ import annotations
 import os
 from typing import Sequence
 
-import torch
+# torch is imported lazily — not needed at module level
+# This allows the module to be imported even without torch installed,
+# so _USE_NLI in divergence.py can be set correctly and degrade gracefully.
 
 _NLI_MODEL_NAME = os.environ.get(
     "CRITERION_NLI_MODEL", "cross-encoder/nli-deberta-v3-small"
@@ -33,16 +35,28 @@ _LABELS = ["contradiction", "entailment", "neutral"]
 
 _model = None
 _tokenizer = None
+_load_failed = False  # Cache load failures to avoid repeated slow attempts
 
 
 def _load_nli():
-    """Load the NLI model and tokenizer once, lazily."""
-    global _model, _tokenizer
+    """Load the NLI model and tokenizer once, lazily.
+
+    Returns (model, tokenizer) or raises ImportError/RuntimeError.
+    Caches failures to avoid repeated slow attempts.
+    """
+    global _model, _tokenizer, _load_failed
+    if _load_failed:
+        raise RuntimeError("NLI model previously failed to load")
     if _model is None:
-        from transformers import AutoTokenizer, AutoModelForSequenceClassification
-        _tokenizer = AutoTokenizer.from_pretrained(_NLI_MODEL_NAME)
-        _model = AutoModelForSequenceClassification.from_pretrained(_NLI_MODEL_NAME)
-        _model.eval()
+        try:
+            import torch  # noqa: F811 — lazy import
+            from transformers import AutoTokenizer, AutoModelForSequenceClassification
+            _tokenizer = AutoTokenizer.from_pretrained(_NLI_MODEL_NAME)
+            _model = AutoModelForSequenceClassification.from_pretrained(_NLI_MODEL_NAME)
+            _model.eval()
+        except Exception as e:
+            _load_failed = True
+            raise
     return _model, _tokenizer
 
 
@@ -52,6 +66,7 @@ def classify_pair(premise: str, hypothesis: str) -> tuple[str, float]:
     Returns (label, confidence) where label is one of
     'contradiction', 'entailment', 'neutral'.
     """
+    import torch
     model, tokenizer = _load_nli()
     inputs = tokenizer(
         premise, hypothesis,
@@ -76,6 +91,7 @@ def classify_batch(
     if not premises:
         return []
 
+    import torch
     model, tokenizer = _load_nli()
     results = []
 

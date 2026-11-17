@@ -303,9 +303,12 @@ def verify_chain(record_path: Path | str | None = None) -> tuple[bool, str]:
     Returns (True, "ok") if the chain is valid, or
     (False, "description of break") if tampered.
     """
+    path = Path(record_path) if record_path else _DEFAULT_RECORD_PATH
+    if not path.exists():
+        return False, f"record file not found: {path}"
     try:
         entries = read_record(record_path)
-    except (json.JSONDecodeError, TypeError, KeyError) as e:
+    except (json.JSONDecodeError, TypeError, KeyError, UnicodeDecodeError) as e:
         return False, f"malformed record: {e}"
     if not entries:
         return True, "empty record"

@@ -310,16 +310,19 @@ _SUFFIX_CANONICAL = {
 def _extract_numbers(text: str) -> set[str]:
     """Extract all number-like tokens, normalized.
 
+    Handles: $1,000  €500  £2.5M  ¥100  -5  +3.2  60%  94.8 billion
     Normalizes suffixes so "94.8 billion" and "94.8B" match.
-    Treats "60%" and "60%" identically.
+    Strips currency symbols before matching.
     """
     normalized = set()
     tokens = text.split()
     i = 0
     while i < len(tokens):
         tok = tokens[i].strip('.,;:!?()')
-        # Check if token starts with a digit
-        core = re.match(r'^(\d[\d,.]*)(.*)$', tok)
+        # Strip leading currency symbols and signs
+        tok_clean = tok.lstrip('$€£¥¢₹₽+-')
+        # Check if token starts with a digit (after stripping currency)
+        core = re.match(r'^(\d[\d,.]*)(.*)$', tok_clean)
         if core:
             num_part = core.group(1).rstrip('.')
             trail = core.group(2).lower()
