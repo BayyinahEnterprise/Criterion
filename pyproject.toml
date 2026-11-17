@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "criterion-ai"
+version = "0.2.0"
+description = "A trust layer for AI-generated content. Your AI's output looks right. Criterion checks whether it is."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Bilal Syed Arfeen", email = "bayyinahenterprises@tuta.com"},
+]
+keywords = ["ai", "trust", "verification", "hallucination", "rag", "llm", "faithfulness"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+semantic = [
+    "sentence-transformers>=2.2",
+    "torch>=2.0",
+]
+all = [
+    "criterion-ai[semantic]",
+]
+dev = [
+    "criterion-ai[all]",
+    "pytest>=7.0",
+    "datasets>=2.14",
+]
+
+[project.scripts]
+criterion = "criterion.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/BayyinahEnterprise/criterion"
+Issues = "https://github.com/BayyinahEnterprise/criterion/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["criterion*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,79 @@
+# Criterion — verify AI-generated content in CI
+#
+# Add this workflow to your repo, or copy the "Run Criterion" step
+# into your existing workflow.
+#
+# Usage:
+#   1. Create a pairs.jsonl file with your source-output pairs:
+#      {"source": "...", "output": "..."}
+#      {"source": "...", "output": "..."}
+#
+#   2. The action runs Criterion and fails if any pair is untrustworthy.
+
+name: Criterion Trust Check
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Verification mode'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - rag
+          - summary
+          - strict
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Criterion
+        run: pip install criterion-ai[semantic]
+
+      - name: Run Criterion
+        run: |
+          MODE="${{ github.event.inputs.mode || 'auto' }}"
+          if [ -f criterion.jsonl ]; then
+            criterion batch criterion.jsonl --mode "$MODE" -o results.jsonl
+          elif [ -f pairs.jsonl ]; then
+            criterion batch pairs.jsonl --mode "$MODE" -o results.jsonl
+          else
+            echo "No pairs file found. Create criterion.jsonl or pairs.jsonl"
+            echo 'Format: {"source": "...", "output": "..."} per line'
+            exit 1
+          fi
+
+      - name: Check results
+        run: |
+          python3 -c "
+          import json, sys
+          untrustworthy = 0
+          with open('results.jsonl') as f:
+              for line in f:
+                  r = json.loads(line)
+                  if not r.get('is_trustworthy', True):
+                      untrustworthy += 1
+                      print(f'✗ {r[\"trust_level\"]}: {r[\"summary\"]}')
+          if untrustworthy:
+              print(f'\n{untrustworthy} untrustworthy output(s) found')
+              sys.exit(1)
+          print('✓ All outputs are trustworthy')
+          "
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-results
+          path: results.jsonl

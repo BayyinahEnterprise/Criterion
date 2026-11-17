@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.criterion/
+*.jsonl
+!tests/**/*.jsonl
+.env
+.venv
+venv/
