@@ -27,6 +27,10 @@ on:
           - summary
           - strict
 
+# The workflow only reads the repository.
+permissions:
+  contents: read
+
 jobs:
   verify:
     runs-on: ubuntu-latest
@@ -39,15 +43,22 @@ jobs:
           python-version: '3.11'
 
       - name: Install Criterion
-        run: pip install criterion-ai[semantic]
+        # [all] includes the NLI model. Without it Criterion cannot detect
+        # contradictions or fabricated claims, and the gate would be hollow.
+        run: pip install "criterion-ai[all]"
 
       - name: Run Criterion
+        # Inputs reach the shell through env, never by ${{ }} interpolation
+        # into the script. --require-nli makes a missing model a hard error.
+        # Tip: prefer an explicit mode. "auto" picks the lenient summary mode
+        # whenever the output is short, and the output is what is under test.
+        env:
+          MODE: ${{ github.event.inputs.mode || 'auto' }}
         run: |
-          MODE="${{ github.event.inputs.mode || 'auto' }}"
           if [ -f criterion.jsonl ]; then
-            criterion batch criterion.jsonl --mode "$MODE" -o results.jsonl
+            criterion batch criterion.jsonl --mode "$MODE" --require-nli --no-record -o results.jsonl
           elif [ -f pairs.jsonl ]; then
-            criterion batch pairs.jsonl --mode "$MODE" -o results.jsonl
+            criterion batch pairs.jsonl --mode "$MODE" --require-nli --no-record -o results.jsonl
           else
             echo "No pairs file found. Create criterion.jsonl or pairs.jsonl"
             echo 'Format: {"source": "...", "output": "..."} per line'
@@ -62,9 +73,11 @@ jobs:
           with open('results.jsonl') as f:
               for line in f:
                   r = json.loads(line)
-                  if not r.get('is_trustworthy', True):
+                  # Fail closed: an error row or a row without a verdict
+                  # is not a trustworthy output.
+                  if r.get('is_trustworthy') is not True:
                       untrustworthy += 1
-                      print(f'✗ {r[\"trust_level\"]}: {r[\"summary\"]}')
+                      print(f'✗ {r.get(\"trust_level\", \"error\")}: {r.get(\"summary\") or r.get(\"error\")}')
           if untrustworthy:
               print(f'\n{untrustworthy} untrustworthy output(s) found')
               sys.exit(1)

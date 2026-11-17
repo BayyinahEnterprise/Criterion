@@ -19,6 +19,15 @@ from criterion.verdict import render_verdict, TrustLevel
 from criterion.record import preserve, verify_chain, read_record
 
 
+def _clean(result) -> bool:
+    """No blocking finding. With NLI that is `is_trustworthy`; on a core-only
+    install the best possible verdict is "unverified" (never trustworthy)."""
+    if result.capabilities.get("nli"):
+        return result.is_trustworthy
+    return result.trust_level == "unverified"
+
+
+
 # ---------------------------------------------------------------------------
 # C-01: Audit chain must detect content tampering
 # ---------------------------------------------------------------------------
@@ -240,7 +249,7 @@ class TestNumericDetection:
             output="The rate is 5%.",
             mode="strict",
         )
-        assert result.is_trustworthy
+        assert _clean(result)
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +323,7 @@ class TestAuditMatrix:
             output="Apple reported $94.8 billion in revenue with iPhone at $51.3 billion.",
             mode="summary",
         )
-        assert result.is_trustworthy, "Valid summary compression should be trustworthy"
+        assert _clean(result), "Valid summary compression should be trustworthy"
 
 
 # ---------------------------------------------------------------------------
@@ -465,7 +474,7 @@ class TestAdversarialExact:
             output="The vaccine is safe.",
             mode="rag",
         )
-        assert result.is_trustworthy, "A concise correct RAG answer should be trustworthy"
+        assert _clean(result), "A concise correct RAG answer should be trustworthy"
 
     def test_summary_fabricated_claim_moon_cheese(self):
         """Summary: fabricated content added to a summary must be caught."""

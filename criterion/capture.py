@@ -32,6 +32,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Sequence
 
+from criterion._version import __version__
+
 
 # ---------------------------------------------------------------------------
 # Atom — the semantic unit
@@ -197,7 +199,7 @@ class CapturedPair:
     captured_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
-    capture_version: str = "0.2.0"
+    capture_version: str = __version__
 
     @property
     def source_hash(self) -> str:

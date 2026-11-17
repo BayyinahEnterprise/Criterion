@@ -16,16 +16,53 @@ import json
 import sys
 from pathlib import Path
 
-from criterion.api import verify, Mode
-from criterion.record import verify_chain
+import os
+
+from criterion.api import verify, Mode, CapabilityError
+from criterion.divergence import InputTooLargeError
+from criterion.record import verify_chain, chain_head, RecordCorruptError, _KEY_ENV
 
 
 def _read_file_or_text(path_or_text: str) -> str:
     """Read from a file path if it exists, otherwise treat as literal text."""
-    p = Path(path_or_text)
-    if p.exists() and p.is_file():
-        return p.read_text(encoding="utf-8")
+    try:
+        p = Path(path_or_text)
+        if p.is_file():
+            return p.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        pass  # too long / not a valid path: it is literal text
     return path_or_text
+
+
+def _add_policy_flags(sub_parser) -> None:
+    sub_parser.add_argument(
+        "--allow-degraded", action="store_true",
+        help="Run heuristics only if the NLI model is unavailable. Clean results are then "
+             "'unverified' (exit 2), never trustworthy. Without this flag a missing model is an error.",
+    )
+    sub_parser.add_argument(
+        "--require-nli", action="store_true",
+        help="(Default behaviour; kept for compatibility.) Fail if the NLI model cannot run.",
+    )
+    sub_parser.add_argument(
+        "--fabrication-threshold", type=float, default=None, metavar="0-1",
+        help="An unsupported sentence blocks trust on its own when its best source support is "
+             "below this. Higher flags more, lower flags less.",
+    )
+    sub_parser.add_argument(
+        "--no-store-text", action="store_true",
+        help="Record only SHA-256 hashes of source/output, not the texts.",
+    )
+
+
+def _policy_kwargs(args) -> dict:
+    kwargs = {
+        "require_nli": False if args.allow_degraded else (True if args.require_nli else None),
+        "store_text": not args.no_store_text,
+    }
+    if args.fabrication_threshold is not None:
+        kwargs["thresholds"] = {"fabrication": args.fabrication_threshold}
+    return kwargs
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -50,10 +87,15 @@ def main(argv: list[str] | None = None) -> int:
     verify_p.add_argument("--no-record", action="store_true", help="Skip recording.")
     verify_p.add_argument("--json", action="store_true", help="Output as JSON.")
     verify_p.add_argument("--quiet", "-q", action="store_true", help="Exit code only.")
+    _add_policy_flags(verify_p)
 
     # chain
     chain_p = sub.add_parser("chain", help="Verify the append-only record chain.")
     chain_p.add_argument("--record", default=None, help="Path to the record file.")
+    chain_p.add_argument("--expect-head", default=None,
+                         help="Head entry id you anchored elsewhere; fail if the ledger does not end there.")
+    chain_p.add_argument("--expect-count", type=int, default=None,
+                         help="Entry count you anchored elsewhere; fail on mismatch (detects truncation).")
 
     # batch
     batch_p = sub.add_parser("batch", help="Verify multiple pairs from a JSONL file.")
@@ -61,6 +103,8 @@ def main(argv: list[str] | None = None) -> int:
     batch_p.add_argument("--mode", "-m", choices=["rag", "summary", "strict", "auto"], default="auto")
     batch_p.add_argument("--output", "-o", help="Output JSONL file.")
     batch_p.add_argument("--no-record", action="store_true")
+    batch_p.add_argument("--record", default=None, help="Path to the record file.")
+    _add_policy_flags(batch_p)
 
     args = parser.parse_args(argv)
 
@@ -71,13 +115,18 @@ def main(argv: list[str] | None = None) -> int:
 
         source_text = _read_file_or_text(args.source)
         output_text = _read_file_or_text(args.output)
-        result = verify(
-            source=source_text,
-            output=output_text,
-            mode=args.mode,
-            record_path=args.record,
-            record=not args.no_record,
-        )
+        try:
+            result = verify(
+                source=source_text,
+                output=output_text,
+                mode=args.mode,
+                record_path=args.record,
+                record=not args.no_record,
+                **_policy_kwargs(args),
+            )
+        except (CapabilityError, RecordCorruptError, InputTooLargeError) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
 
         if hasattr(args, "quiet") and args.quiet:
             return 0 if result.is_trustworthy else 2
@@ -93,9 +142,18 @@ def main(argv: list[str] | None = None) -> int:
         return _run_batch(args)
 
     elif args.command == "chain":
-        ok, msg = verify_chain(args.record)
+        ok, msg = verify_chain(
+            args.record, expected_head=args.expect_head, expected_count=args.expect_count,
+        )
         if ok:
             print(f"✓ {msg}")
+            head, count = chain_head(args.record)
+            print(f"  head: {head}  entries: {count}")
+            if not os.environ.get(_KEY_ENV):
+                print(f"  note: unkeyed chain — detects edits, not a full rewrite. Set {_KEY_ENV} to key it.")
+            if args.expect_head is None and args.expect_count is None:
+                print("  note: store the head and count somewhere the writer cannot reach, then pass "
+                      "--expect-head/--expect-count to detect truncation.")
             return 0
         else:
             print(f"✗ CHAIN BROKEN: {msg}")
@@ -106,9 +164,15 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _print_human(result) -> None:
-    sym = {"faithful": "✓", "adapted": "~", "divergent": "!", "unreliable": "✗"}.get(result.trust_level, "?")
+    sym = {"faithful": "✓", "adapted": "~", "divergent": "!", "unreliable": "✗", "unverified": "?"}.get(result.trust_level, "?")
     print(f"\n  {sym} {result.trust_level.upper()} — {result.trust_score:.0%} trust  [mode: {result.mode}]\n")
     print(f"  {result.summary}\n")
+    if result.groundedness is not None:
+        print(f"  Groundedness (weakest sentence's source support): {result.groundedness:.2f}\n")
+    caps = result.capabilities
+    if caps and not caps.get("nli"):
+        print(f"  ⚠ NLI did not run ({caps.get('nli_error') or 'unavailable'}).")
+        print("    Contradictions and fabricated claims were NOT checked. pip install criterion-ai[nli]\n")
 
     if result.total_divergences > 0:
         print(f"  Divergences ({len(result.divergences)} atom-level, {len(result.broken_bonds)} broken bonds):")
@@ -141,26 +205,35 @@ def _run_batch(args) -> int:
         return 1
 
     results = []
-    with open(input_path) as f:
+    with open(input_path, encoding="utf-8") as f:
         for line_num, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
             try:
                 obj = json.loads(line)
+                if not isinstance(obj, dict):
+                    results.append({"error": "line is not a JSON object", "line": line_num})
+                    continue
                 source = obj.get("source", "")
                 output = obj.get("output", "")
-                # Reject empty/missing source or output
-                if not source or not output:
-                    results.append({"error": "missing source or output", "line": line_num})
+                # Reject empty/missing/non-string source or output
+                if not isinstance(source, str) or not isinstance(output, str) or not source or not output:
+                    results.append({"error": "missing or non-string source or output", "line": line_num})
                     continue
                 result = verify(
                     source=source,
                     output=output,
                     mode=args.mode,
+                    record_path=args.record,
                     record=not args.no_record,
+                    **_policy_kwargs(args),
                 )
                 results.append(result.to_dict())
+            except (CapabilityError, RecordCorruptError) as e:
+                # Not a per-pair problem: the gate itself cannot run. Stop.
+                print(f"Error: {e}", file=sys.stderr)
+                return 1
             except Exception as e:
                 results.append({"error": str(e), "line": line_num})
 
@@ -170,7 +243,7 @@ def _run_batch(args) -> int:
         return 1
 
     output_path = args.output or str(input_path.with_suffix(".results.jsonl"))
-    with open(output_path, "w") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         for r in results:
             f.write(json.dumps(r) + "\n")
 

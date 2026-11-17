@@ -42,7 +42,16 @@ FAITHFUL_THRESHOLD = 0.75   # Above this: paraphrase, not a divergence
 DIVERGENT_THRESHOLD = 0.35  # Below this: genuinely different meaning
 
 # Model name (can be overridden via env var)
-_MODEL_NAME = os.environ.get("CRITERION_MODEL", "all-MiniLM-L6-v2")
+_DEFAULT_MODEL = "all-MiniLM-L6-v2"
+_DEFAULT_REVISION = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
+_MODEL_NAME = os.environ.get("CRITERION_MODEL", _DEFAULT_MODEL)
+# Pinned so a verdict cannot change because upstream weights moved.
+# The pin only applies to the default model; set CRITERION_MODEL_REVISION
+# to pin a custom one.
+_MODEL_REVISION = os.environ.get(
+    "CRITERION_MODEL_REVISION",
+    _DEFAULT_REVISION if _MODEL_NAME == _DEFAULT_MODEL else "",
+) or None
 
 
 # ---------------------------------------------------------------------------
@@ -57,8 +66,22 @@ def _get_model():
     global _model
     if _model is None:
         from sentence_transformers import SentenceTransformer
-        _model = SentenceTransformer(_MODEL_NAME)
+        _model = SentenceTransformer(_MODEL_NAME, revision=_MODEL_REVISION)
     return _model
+
+
+def model_info() -> dict[str, str | None]:
+    """Which embedding model this process is configured to use."""
+    return {"model": _MODEL_NAME, "revision": _MODEL_REVISION}
+
+
+def encode_texts(texts: Sequence[str]) -> np.ndarray:
+    """Encode texts into L2-normalised embeddings, shape (n, dim)."""
+    if not texts:
+        return np.empty((0, 0))
+    embs = _get_model().encode(list(texts), convert_to_numpy=True, show_progress_bar=False)
+    norms = np.linalg.norm(embs, axis=1, keepdims=True)
+    return embs / np.maximum(norms, 1e-9)
 
 
 # ---------------------------------------------------------------------------

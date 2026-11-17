@@ -22,22 +22,35 @@ Three modes for three use cases:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from criterion.capture import capture, CapturedPair
 from criterion.divergence import (
     find_divergences,
+    Thresholds,
     Divergence,
     BondDivergence,
     DivergenceReport,
     DivergenceType,
     Severity,
 )
-from criterion.verdict import render_verdict, Verdict, TrustLevel
+from criterion.verdict import (
+    render_verdict, Verdict, TrustLevel,
+    _compute_trust_score, _classify_trust, _compute_direction,
+)
 from criterion.record import preserve, RecordEntry
+
+
+class CapabilityError(RuntimeError):
+    """A detector the caller required (e.g. NLI) did not run."""
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 class Mode(Enum):
@@ -87,6 +100,20 @@ class VerifyResult:
     _report: DivergenceReport
     _pair: CapturedPair
 
+    # Which detectors actually ran: {"nli": bool, "semantic": bool, ...}.
+    # If "nli" is False, meaning-level contradictions and fabricated
+    # claims were NOT checked and a clean verdict means much less.
+    capabilities: dict[str, Any] = field(default_factory=dict)
+
+    # Per output sentence NLI judged: {"text", "support"}; support is the
+    # best entailment (0-1) any relevant source passage gives that sentence.
+    sentence_support: tuple[dict[str, Any], ...] = ()
+    # The weakest sentence's support — one number to threshold or chart.
+    # None when NLI did not run or judged nothing (e.g. fragment answers).
+    groundedness: float | None = None
+    # The thresholds this verdict was decided with.
+    thresholds: dict[str, float] = field(default_factory=dict)
+
     def to_dict(self) -> dict:
         """Serialize to a dictionary for JSON output."""
         return {
@@ -101,9 +128,14 @@ class VerifyResult:
             "summary": self.summary,
             "mode": self.mode,
             "record_id": self.record_id,
+            "capabilities": dict(self.capabilities),
+            "groundedness": self.groundedness,
+            "sentence_support": list(self.sentence_support),
+            "thresholds": dict(self.thresholds),
             "divergences": [
                 {
                     "type": d.dtype.value,
+                    "code": d.code,
                     "severity": d.severity.value,
                     "explanation": d.explanation,
                     "confidence": d.confidence,
@@ -146,6 +178,11 @@ def verify(
     mode: str | Mode | None = None,
     record_path: Path | str | None = None,
     record: bool = True,
+    *,
+    require_nli: bool | None = None,
+    store_text: bool = True,
+    thresholds: Thresholds | dict[str, float] | None = None,
+    question: str | None = None,
 ) -> VerifyResult:
     """Verify an AI-generated output against its source.
 
@@ -161,10 +198,23 @@ def verify(
         record_path: Path for the append-only record. Set record=False
                      to skip recording.
         record: Whether to write to the append-only record.
+        require_nli: Default True: raise CapabilityError when the NLI
+                     model did not run, because without it Criterion
+                     cannot see contradictions or fabricated claims.
+                     Pass False (or set CRITERION_REQUIRE_NLI=0) to run
+                     heuristics only; a clean result is then reported as
+                     "unverified" and is never trustworthy.
+        thresholds: A Thresholds object or a dict such as
+                    {"fabrication": 0.05}. `fabrication` is the main
+                    precision/recall dial: an unsupported sentence blocks
+                    trust on its own only when its best source support is
+                    below it. Higher flags more; lower flags less.
+        store_text: If False, the record keeps only SHA-256 hashes of
+                    source and output, not the texts (sensitive data).
 
     Returns:
-        A VerifyResult with trust assessment, divergences, and
-        suggested corrections.
+        A VerifyResult with trust assessment, divergences, suggested
+        corrections, and `capabilities` (which detectors actually ran).
 
     Examples::
 
@@ -192,8 +242,18 @@ def verify(
         result = criterion.verify(source=src, output=out, mode="strict")
         sys.exit(0 if result.is_trustworthy else 1)
     """
+    if not isinstance(source, str) or not isinstance(output, str):
+        raise TypeError("source and output must be strings")
+    if require_nli is None:
+        env = os.environ.get("CRITERION_REQUIRE_NLI", "").strip().lower()
+        require_nli = env not in ("0", "false", "no", "off")
+    if isinstance(thresholds, dict):
+        thresholds = Thresholds(**thresholds)
+    elif thresholds is None:
+        thresholds = Thresholds()
+
     # Resolve mode
-    if mode is None or mode == "auto":
+    if mode is None or mode == "auto" or mode == Mode.AUTO:
         resolved_mode = _auto_detect_mode(source, output)
     elif isinstance(mode, str):
         resolved_mode = Mode(mode)
@@ -201,69 +261,115 @@ def verify(
         resolved_mode = mode
 
     # Empty input invariants — a trust layer cannot call empty output "faithful"
-    source_empty = not source or not source.strip()
-    output_empty = not output or not output.strip()
-    if source_empty and output_empty:
-        return _invalid_input_result(resolved_mode, "Both source and output are empty")
-    if output_empty and not source_empty:
-        return _empty_output_result(resolved_mode, record, record_path, source, output)
-    if source_empty and not output_empty:
-        return _ungrounded_output_result(resolved_mode, record, record_path, source, output)
+    source_empty = not source.strip()
+    output_empty = not output.strip()
+    if source_empty or output_empty:
+        if source_empty and output_empty:
+            reason = "Both source and output are empty"
+        elif output_empty:
+            reason = "Output is empty. No content to verify against source."
+        else:
+            reason = "Source is empty. Output cannot be verified as grounded."
+        return _degenerate_result(
+            resolved_mode, reason, source, output,
+            # Nothing to record when there is no input at all.
+            do_record=record and not (source_empty and output_empty),
+            record_path=record_path, store_text=store_text,
+        )
 
-    # Run the pipeline
+    # Run the pipeline. The mode is passed down so that detection leniency
+    # is the caller's decision, never a side effect of the output's length.
     pair = capture(source, output)
-    report = find_divergences(pair)
+    if question is not None and not isinstance(question, str):
+        raise TypeError("question must be a string")
+    report = find_divergences(
+        pair, mode=resolved_mode.value, thresholds=thresholds, question=question,
+    )
+    capabilities = dict(report.capabilities)
+    if require_nli and not capabilities.get("nli"):
+        raise CapabilityError(
+            "The NLI model did not run "
+            f"({capabilities.get('nli_error') or 'unavailable'}), so contradictions and "
+            "fabricated claims cannot be checked. Install it with "
+            "`pip install criterion-ai[nli]`, or pass require_nli=False "
+            "(CLI: --allow-degraded) to run heuristics only; clean results are "
+            "then reported as 'unverified'."
+        )
     verdict = render_verdict(report)
 
     # Apply mode-specific filtering
     filtered_divs = _apply_mode(verdict.divergences, resolved_mode)
-    # In RAG mode, filter broken bonds from omissions (the answer is selective)
     if resolved_mode == Mode.RAG:
-        filtered_bond_divs = ()  # RAG answers don't need all evidence
+        # A RAG answer is selective, so dropped evidence does not block.
+        # It is still reported: the reader should know the answer kept a
+        # claim and left its support behind.
+        filtered_divs += tuple(
+            Divergence(
+                dtype=DivergenceType.CONCEALING,
+                severity=Severity.MINOR,
+                source_atom=bd.source_atom,
+                output_atom=None,
+                explanation=bd.explanation,
+                confidence=0.3,
+                suggested_correction=f"Consider citing: {bd.source_atom.text}",
+                verification_method="Check whether the answer's claim still stands without this evidence",
+                code="evidence_not_carried",
+            )
+            for bd in verdict.bond_divergences
+        )
+        filtered_bond_divs: tuple[BondDivergence, ...] = ()
     else:
         filtered_bond_divs = verdict.bond_divergences
 
-    # Imports for rescoring and record building
-    from criterion.verdict import (
-        Verdict as _Verdict, _compute_trust_score, _classify_trust,
-        _compute_direction,
+    # Score what is actually returned
+    score = _compute_trust_score(filtered_divs, filtered_bond_divs)
+    crit = sum(1 for d in filtered_divs if d.severity == Severity.CRITICAL)
+    maj = sum(1 for d in filtered_divs if d.severity == Severity.MAJOR)
+    minor = sum(1 for d in filtered_divs if d.severity == Severity.MINOR)
+    level = _classify_trust(score, crit, maj, len(filtered_bond_divs))
+    if not capabilities.get("nli") and level in (TrustLevel.FAITHFUL, TrustLevel.ADAPTED):
+        # Heuristics found nothing blocking, but the detector that looks for
+        # contradictions and fabrications never ran. That is not "faithful".
+        level = TrustLevel.UNVERIFIED
+    is_trust = level in (TrustLevel.FAITHFUL, TrustLevel.ADAPTED)
+    summary = _build_filtered_summary(level, score, filtered_divs, filtered_bond_divs)
+    if not capabilities.get("nli"):
+        summary += " [NLI did not run: contradictions and fabricated claims were not checked.]"
+    out_text = {a.index: a.text for a in pair.output.atoms}
+    sentence_support = tuple(
+        {"text": out_text[i], "support": sc} for i, sc in report.support.items() if i in out_text
     )
-
-    # Re-score with filtered divergences if mode changed anything
-    if len(filtered_divs) != len(verdict.divergences):
-        score = _compute_trust_score(filtered_divs, filtered_bond_divs)
-        crit = sum(1 for d in filtered_divs if d.severity == Severity.CRITICAL)
-        maj = sum(1 for d in filtered_divs if d.severity == Severity.MAJOR)
-        level = _classify_trust(score, crit, maj, len(filtered_bond_divs))
-        is_trust = level in (TrustLevel.FAITHFUL, TrustLevel.ADAPTED)
-    else:
-        score = verdict.trust_score
-        level = verdict.trust_level
-        is_trust = verdict.is_trustworthy
-        crit = verdict.critical_count
-        maj = verdict.major_count
+    groundedness = min((x["support"] for x in sentence_support), default=None)
+    threshold_dict = {
+        "grounded": thresholds.grounded, "contradiction": thresholds.contradiction,
+        "fabrication": thresholds.fabrication, "equivalence": thresholds.equivalence,
+        "realign": thresholds.realign,
+    }
 
     # Record — store the FILTERED verdict so record matches what was returned
     record_id = None
     if record:
-        filtered_verdict = _Verdict(
+        filtered_verdict = Verdict(
             trust_score=score,
             trust_level=level,
             total_divergences=len(filtered_divs) + len(filtered_bond_divs),
             critical_count=crit,
             major_count=maj,
-            minor_count=sum(1 for d in filtered_divs if d.severity == Severity.MINOR),
+            minor_count=minor,
             cosmetic_count=sum(1 for d in filtered_divs if d.severity == Severity.COSMETIC),
             broken_bonds=len(filtered_bond_divs),
             direction=_compute_direction(filtered_divs),
-            summary=_build_filtered_summary(level, score, filtered_divs, filtered_bond_divs),
+            summary=summary,
             divergences=filtered_divs,
             bond_divergences=filtered_bond_divs,
         )
-        entry = preserve(pair, report, filtered_verdict, record_path)
+        entry = preserve(
+            pair, report, filtered_verdict, record_path,
+            mode=resolved_mode.value,
+            detector_config=_detector_config(capabilities, threshold_dict),
+            store_text=store_text,
+        )
         record_id = entry.entry_id
-
-    minor = sum(1 for d in filtered_divs if d.severity == Severity.MINOR)
 
     return VerifyResult(
         trust_score=score,
@@ -275,7 +381,7 @@ def verify(
         critical_count=crit,
         major_count=maj,
         minor_count=minor,
-        summary=_build_filtered_summary(level, score, filtered_divs, filtered_bond_divs),
+        summary=summary,
         corrections=tuple(
             d.suggested_correction for d in filtered_divs
             if d.severity in (Severity.CRITICAL, Severity.MAJOR)
@@ -285,7 +391,35 @@ def verify(
         _verdict=verdict,
         _report=report,
         _pair=pair,
+        capabilities=capabilities,
+        sentence_support=sentence_support,
+        groundedness=groundedness,
+        thresholds=threshold_dict,
     )
+
+
+def _detector_config(
+    capabilities: dict[str, Any], thresholds: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    """What produced this verdict: detectors that ran, models, thresholds."""
+    config: dict[str, Any] = {
+        "nli": bool(capabilities.get("nli")),
+        "semantic": bool(capabilities.get("semantic")),
+        "nli_error": capabilities.get("nli_error"),
+        "semantic_error": capabilities.get("semantic_error"),
+        "thresholds": dict(thresholds) if thresholds else None,
+    }
+    try:
+        from criterion.nli import model_info as _nli_info
+        config["nli_model"] = _nli_info()
+    except ImportError:
+        config["nli_model"] = None
+    try:
+        from criterion.semantic import model_info as _sem_info
+        config["semantic_model"] = _sem_info()
+    except ImportError:
+        config["semantic_model"] = None
+    return config
 
 
 def _apply_mode(
@@ -309,10 +443,10 @@ def _apply_mode(
             # Omissions are ALWAYS expected in summaries, even critical ones
             if d.dtype == DivergenceType.OMISSION:
                 continue
-            # Numeric omissions (numbers dropped, not changed) are compression
-            if d.severity == Severity.CRITICAL and "Numeric values changed" in d.explanation:
-                if "set()" in d.explanation:
-                    continue  # One side empty = number was dropped, not changed
+            # Numbers dropped (not changed) are compression. Keyed off the
+            # finding code, not the wording of the explanation.
+            if d.code == "numeric_dropped":
+                continue
             # Keep critical findings (numeric changes, negation inversions, etc.)
             if d.severity == Severity.CRITICAL:
                 result.append(d)
@@ -363,6 +497,7 @@ def verify_batch(
     mode: str | Mode | None = None,
     record_path: Path | str | None = None,
     record: bool = True,
+    **kwargs: Any,
 ) -> list[VerifyResult]:
     """Verify multiple source-output pairs.
 
@@ -376,7 +511,7 @@ def verify_batch(
         List of VerifyResult, one per pair.
     """
     return [
-        verify(src, out, mode=mode, record_path=record_path, record=record)
+        verify(src, out, mode=mode, record_path=record_path, record=record, **kwargs)
         for src, out in pairs
     ]
 
@@ -401,53 +536,31 @@ def _build_filtered_summary(
     return " ".join(parts)
 
 
-def _empty_output_result(mode, do_record, record_path, source, output) -> VerifyResult:
-    """Empty output with nonempty source is always unreliable."""
-    from criterion.verdict import TrustLevel
-    return VerifyResult(
-        trust_score=0.0,
-        trust_level="unreliable",
-        is_trustworthy=False,
-        divergences=(),
-        broken_bonds=(),
-        total_divergences=0,
-        critical_count=0,
-        major_count=0,
-        minor_count=0,
-        summary="Output is empty. No content to verify against source.",
-        corrections=(),
-        mode=mode.value,
-        record_id=None,
-        _verdict=None,
-        _report=None,
-        _pair=None,
-    )
+def _degenerate_result(
+    mode: Mode, reason: str, source: str, output: str,
+    *, do_record: bool, record_path, store_text: bool,
+) -> VerifyResult:
+    """Empty source and/or output: never trustworthy, and still recorded.
 
-
-def _ungrounded_output_result(mode, do_record, record_path, source, output) -> VerifyResult:
-    """Nonempty output with empty source cannot be grounded."""
-    return VerifyResult(
-        trust_score=0.0,
-        trust_level="unreliable",
-        is_trustworthy=False,
-        divergences=(),
-        broken_bonds=(),
-        total_divergences=0,
-        critical_count=0,
-        major_count=0,
-        minor_count=0,
-        summary="Source is empty. Output cannot be verified as grounded.",
-        corrections=(),
-        mode=mode.value,
-        record_id=None,
-        _verdict=None,
-        _report=None,
-        _pair=None,
-    )
-
-
-def _invalid_input_result(mode, reason: str) -> VerifyResult:
-    """Both inputs invalid — cannot verify."""
+    An empty output is exactly the kind of event an audit trail must
+    show, so it is written to the record like any other verdict.
+    """
+    record_id = None
+    if do_record:
+        pair = capture(source, output)
+        verdict = Verdict(
+            trust_score=0.0, trust_level=TrustLevel.UNRELIABLE,
+            total_divergences=0, critical_count=0, major_count=0,
+            minor_count=0, cosmetic_count=0, broken_bonds=0,
+            direction=_compute_direction(()), summary=reason,
+            divergences=(), bond_divergences=(),
+        )
+        entry = preserve(
+            pair, None, verdict, record_path,
+            mode=mode.value, detector_config=_detector_config({}),
+            store_text=store_text,
+        )
+        record_id = entry.entry_id
     return VerifyResult(
         trust_score=0.0,
         trust_level="unreliable",
@@ -461,7 +574,7 @@ def _invalid_input_result(mode, reason: str) -> VerifyResult:
         summary=reason,
         corrections=(),
         mode=mode.value,
-        record_id=None,
+        record_id=record_id,
         _verdict=None,
         _report=None,
         _pair=None,
