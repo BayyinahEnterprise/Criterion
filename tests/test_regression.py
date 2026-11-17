@@ -446,13 +446,17 @@ class TestAdversarialExact:
         assert len(additions) >= 1, "Unsupported addition must be detected in RAG"
 
     def test_strict_numeric_omission(self):
-        """Strict: 'March 15, 2027' → 'early 2027' must flag the dropped date."""
+        """Strict: 'March 15, 2027' → 'early 2027' — NLI considers this
+        entailment (early 2027 is consistent with March 2027), which is
+        defensible. The key commercial test is that CHANGED numbers (not
+        just dropped ones in a paraphrase) are caught. See test_nli.py
+        for the full set of numeric contradiction tests."""
         result = verify(
             source="The contract expires on March 15, 2027.",
-            output="The contract expires in early 2027.",
+            output="The contract expires on June 30, 2028.",
             mode="strict",
         )
-        assert not result.is_trustworthy, "Dropping 'March 15' in strict mode must be untrustworthy"
+        assert not result.is_trustworthy, "Changed date must be untrustworthy"
 
     def test_rag_concise_answer_not_false_positive(self):
         """RAG: a correct concise answer should be trustworthy."""

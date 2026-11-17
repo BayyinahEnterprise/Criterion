@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "criterion-ai"
-version = "0.2.3"
+version = "0.3.0"
 description = "A trust layer for AI-generated content. Your AI's output looks right. Criterion checks whether it is."
 readme = "README.md"
 license = {text = "MIT"}
@@ -33,8 +33,12 @@ semantic = [
     "sentence-transformers>=2.2",
     "torch>=2.0",
 ]
+nli = [
+    "transformers>=4.30",
+    "torch>=2.0",
+]
 all = [
-    "criterion-ai[semantic]",
+    "criterion-ai[semantic,nli]",
 ]
 dev = [
     "criterion-ai[all]",

@@ -53,6 +53,13 @@ try:
 except ImportError:
     _USE_SEMANTIC = False
 
+# NLI contradiction detection (optional — degrades gracefully)
+_USE_NLI = True
+try:
+    from criterion.nli import classify_batch as _nli_classify_batch
+except ImportError:
+    _USE_NLI = False
+
 
 # ---------------------------------------------------------------------------
 # Divergence taxonomy — four paired axes, eight types
@@ -339,6 +346,7 @@ def _extract_numbers(text: str) -> set[str]:
 def _classify_matched_pair(
     source: Atom, output: Atom, similarity: float,
     semantic_sim: float | None = None,
+    nli_label: str | None = None,
 ) -> Divergence | None:
     src_norm = _normalize(source.text)
     out_norm = _normalize(output.text)
@@ -351,13 +359,18 @@ def _classify_matched_pair(
     # These catch factual changes that word/semantic similarity misses.
 
     # Numeric change detection — numbers matter more than words.
-    # "60% improved" vs "90% cured" has high word similarity but is
-    # a factual fabrication. Embedding models miss this.
     src_numbers = _extract_numbers(source.text)
     out_numbers = _extract_numbers(output.text)
     # Flag when numbers differ between source and output.
-    # Any symmetric difference = a numeric change worth reporting.
     changed_numbers = src_numbers.symmetric_difference(out_numbers)
+    # If NLI says entailment, only flag when numbers were REPLACED
+    # (both sides have numbers but they differ), not just removed
+    # (a faithful paraphrase like "365 days" → "about a year")
+    if nli_label == "entailment":
+        numbers_added = out_numbers - src_numbers
+        numbers_replaced = src_numbers and out_numbers and src_numbers != out_numbers and numbers_added
+        if not numbers_replaced:
+            changed_numbers = set()  # Suppress numeric removal under NLI entailment
     if changed_numbers and (src_numbers or out_numbers):
         return Divergence(
             dtype=DivergenceType.SURFACING,
@@ -631,6 +644,16 @@ def find_divergences(pair: CapturedPair) -> DivergenceReport:
         except Exception:
             pass  # Degrade gracefully to word-only
 
+    # NLI contradiction detection for matched pairs (if available)
+    nli_results: list[tuple[str, float] | None] = [None] * len(matched)
+    if _USE_NLI and matched:
+        try:
+            src_texts_nli = [src.text for src, _, _ in matched]
+            out_texts_nli = [out.text for _, out, _ in matched]
+            nli_results = _nli_classify_batch(src_texts_nli, out_texts_nli)
+        except Exception:
+            pass  # Degrade gracefully
+
     # Compute retention ratio BEFORE classification so summary mode
     # can downgrade matched-pair divergences too.
     total_source = len(pair.source.atoms)
@@ -642,7 +665,35 @@ def find_divergences(pair: CapturedPair) -> DivergenceReport:
     divergences: list[Divergence] = []
 
     for i, (src, out, sim) in enumerate(matched):
-        div = _classify_matched_pair(src, out, sim, semantic_sim=sem_sims[i])
+        # NLI override: if the model says CONTRADICTION, that's authoritative
+        nli = nli_results[i]
+        if nli is not None:
+            nli_label, nli_conf = nli
+            if nli_label == "contradiction" and nli_conf >= 0.7:
+                div = Divergence(
+                    dtype=DivergenceType.SURFACING,
+                    severity=Severity.CRITICAL,
+                    source_atom=src,
+                    output_atom=out,
+                    explanation=f"NLI contradiction detected ({nli_conf:.0%} confidence): meaning reversed or materially changed",
+                    confidence=nli_conf,
+                    suggested_correction=src.text,
+                    verification_method=f"NLI model classifies this pair as contradiction with {nli_conf:.0%} confidence",
+                )
+                divergences.append(div)
+                continue
+            if nli_label == "entailment" and nli_conf >= 0.8:
+                # NLI says the meaning is preserved. Only let through
+                # heuristic findings that are STRONGER than NLI entailment:
+                # numeric changes where numbers were REPLACED (not just
+                # rephrased), and direct negation additions/removals.
+                # Skip the entailment-override — fall through to heuristics
+                # but mark that NLI confirmed entailment so numeric
+                # detector can be more lenient on removals.
+                pass  # Fall through, but NLI entailment is recorded
+
+        _nli_lbl = nli_results[i][0] if nli_results[i] else None
+        div = _classify_matched_pair(src, out, sim, semantic_sim=sem_sims[i], nli_label=_nli_lbl)
         if div is not None:
             # In summary mode, downgrade intensity shifts and compression
             # effects. Summaries reword and compress; that's their job.
