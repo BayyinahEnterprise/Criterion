@@ -50,6 +50,11 @@ def _add_policy_flags(sub_parser) -> None:
              "below this. Higher flags more, lower flags less.",
     )
     sub_parser.add_argument(
+        "--fail-on-unsure", action="store_true",
+        help="Exit 3 when the verdict is trustworthy but the two grounding models disagree on "
+             "some sentence. Without this flag such a result exits 0 and is only labelled unsure.",
+    )
+    sub_parser.add_argument(
         "--no-store-text", action="store_true",
         help="Record only SHA-256 hashes of source/output, not the texts.",
     )
@@ -129,14 +134,14 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
         if hasattr(args, "quiet") and args.quiet:
-            return 0 if result.is_trustworthy else 2
+            return _exit_code(result, args)
 
         if hasattr(args, "json") and args.json:
             print(json.dumps(result.to_dict(), indent=2))
         else:
             _print_human(result)
 
-        return 0 if result.is_trustworthy else 2
+        return _exit_code(result, args)
 
     elif args.command == "batch":
         return _run_batch(args)
@@ -163,12 +168,29 @@ def main(argv: list[str] | None = None) -> int:
     return 1
 
 
+def _exit_code(result, args) -> int:
+    """0 trustworthy, 2 not, 3 trustworthy-but-unsure when --fail-on-unsure."""
+    if not result.is_trustworthy:
+        return 2
+    if getattr(args, "fail_on_unsure", False) and result.confidence == "unsure":
+        return 3
+    return 0
+
+
 def _print_human(result) -> None:
     sym = {"faithful": "✓", "adapted": "~", "divergent": "!", "unreliable": "✗", "unverified": "?"}.get(result.trust_level, "?")
     print(f"\n  {sym} {result.trust_level.upper()} — {result.trust_score:.0%} trust  [mode: {result.mode}]\n")
     print(f"  {result.summary}\n")
     if result.groundedness is not None:
-        print(f"  Groundedness (weakest sentence's source support): {result.groundedness:.2f}\n")
+        print(f"  Groundedness (weakest sentence's source support): {result.groundedness:.2f}")
+        if result.confidence:
+            note = {
+                "confident": "both grounding models agree, clearly",
+                "probable": "both grounding models agree, at least one narrowly",
+                "unsure": f"the grounding models disagree on {result.unsure_count} sentence(s) — check by hand",
+            }[result.confidence]
+            print(f"  Confidence: {result.confidence} ({note})")
+        print()
     caps = result.capabilities
     if caps and not caps.get("model_checked"):
         print(f"  ⚠ The grounding model did not run ({caps.get('scorer_error') or 'unavailable'}).")
@@ -251,12 +273,17 @@ def _run_batch(args) -> int:
     errors = sum(1 for r in results if "error" in r)
     trustworthy = sum(1 for r in results if r.get("is_trustworthy"))
     untrustworthy = total - errors - trustworthy
+    unsure = sum(1 for r in results if r.get("is_trustworthy") and r.get("confidence") == "unsure")
     print(f"\n  Batch: {total} pairs → {trustworthy} trustworthy, {untrustworthy} flagged, {errors} errors")
+    if unsure:
+        print(f"  Of the trustworthy, {unsure} are unsure: the grounding models disagree on some sentence.")
     print(f"  Results: {output_path}")
     if errors:
         return 1  # Processing errors
     if untrustworthy > 0:
         return 2  # Untrustworthy content found
+    if unsure and getattr(args, "fail_on_unsure", False):
+        return 3  # Trustworthy on average, but the models disagree
     return 0
 
 

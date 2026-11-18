@@ -6,7 +6,7 @@ Criterion is a trust layer for AI-generated content. It decomposes text into sem
 
 No API keys. No external services. Runs locally.
 
-> **Status: Alpha (v0.5.0).** Suitable for developer evaluation and assisted review. Not yet validated for autonomous high-stakes trust decisions. See [Limitations](#limitations) for what it catches and what it misses.
+> **Status: Alpha (v0.6.0).** Suitable for developer evaluation and assisted review. Not yet validated for autonomous high-stakes trust decisions. See [Limitations](#limitations) for what it catches and what it misses.
 
 ## Install
 
@@ -19,18 +19,21 @@ pip install "criterion-ai[all] @ git+https://github.com/BayyinahEnterprise/Crite
 | Install | Adds | What it can do |
 |---------|------|----------------|
 | `criterion-ai` | ~2 MB | Deterministic checks only: changed numbers, sign flips, negation, role swaps, hidden characters. Can find a problem; can never clear an output (see below) |
-| `criterion-ai[nli]` | PyTorch, plus two models downloaded on first use: a ~1.4 GB grounding scorer and a ~740 MB NLI model | Decides, sentence by sentence, whether the source supports the output; labels contradictions; strict-mode omission checks |
+| `criterion-ai[nli]` | PyTorch, plus three models downloaded on first use: two grounding scorers (~1.4 GB and ~1.7 GB) and a ~740 MB NLI model | Decides, sentence by sentence, whether the source supports the output; labels contradictions; strict-mode omission checks |
 | `criterion-ai[all]` | + a ~90 MB embedding model | Better passage ranking and paraphrase recognition |
 
 ### The models, and what happens without them
 
 | Model | Job | Licence |
 |-------|-----|---------|
-| `lytang/MiniCheck-RoBERTa-Large` | **Grounding scorer.** P(supported) for each output sentence, taken as the maximum over ~400-token chunks of the source. This decides the verdict. | MIT |
+| `lytang/MiniCheck-RoBERTa-Large` | **Grounding scorer 1.** P(supported) for each output sentence, taken as the maximum over ~400-token chunks of the source. | MIT |
+| `yaxili96/FactCG-DeBERTa-v3-Large` | **Grounding scorer 2.** The same question, asked of a differently trained model. The verdict is decided by the average of the two; where they disagree the sentence is labelled *unsure*. | MIT |
 | `tasksource/deberta-base-long-nli` | **Labeller.** Says whether a failed sentence contradicts the source or merely lacks support; powers strict-mode omission checks and `question=` | Apache-2.0 |
 | `all-MiniLM-L6-v2` | Passage ranking | Apache-2.0 |
 
-All three are pinned to fixed revisions, and the scorer is loaded from safetensors only (no pickle is ever deserialised; the pinned MiniCheck revision is the Hub's safetensors conversion, verified tensor-for-tensor against the authors' original). `CRITERION_SCORER=factcg` selects `yaxili96/FactCG-DeBERTa-v3-Large` (MIT, ~1.7 GB, about twice as slow, equally accurate in our measurement); `CRITERION_SCORER=nli` uses the NLI model as the scorer (smaller download, about eight points less accurate).
+All four are pinned to fixed revisions, and the scorers are loaded from safetensors only (no pickle is ever deserialised; the pinned MiniCheck revision is the Hub's safetensors conversion, verified tensor-for-tensor against the authors' original).
+
+`CRITERION_SCORER` chooses the scorer: `ensemble` (default, both models), `minicheck` or `factcg` alone (roughly a third and two thirds of the time, and no confidence label), or `nli` (smaller download, about eight points less accurate). Several can be joined with `+`. If any configured model cannot load, the scorer as a whole fails; it never quietly carries on with fewer.
 
 Criterion **fails closed**. If the grounding scorer is not installed or cannot load, `verify()` raises `CapabilityError`, because without it nothing checks whether the source supports the output — and that is the job. A working NLI model alone does not count.
 
@@ -73,6 +76,24 @@ criterion.verify(source=docs, output=answer, mode="rag", thresholds={"grounded":
 - `verbatim` (default 0.9): how close to a word-for-word copy a sentence must be before a deterministic check (changed number, flipped negation, role swap) may overrule the scorer. Below it such a check is shown as a note, because a summary sentence is not wrong for differing from whichever source sentence it happens to resemble.
 
 On the CLI: `--fabrication-threshold`. The Benchmarks section shows what the `grounded` dial buys.
+
+### Confidence: a third answer
+
+Two grounding models score every sentence. Their average decides the verdict; whether they agree says how much weight it will bear.
+
+```python
+result.confidence          # "confident" | "probable" | "unsure" | None (one model only)
+result.unsure_count        # sentences the two models disagree on
+result.sentence_support    # each row also carries "models": {"minicheck": .., "factcg": ..} and "confidence"
+```
+
+| Label | Meaning | Share of claims | Verdict was right |
+|-------|---------|-----------------|-------------------|
+| `confident` | both models agree, each at least 0.3 clear of the threshold | 58% | 89% |
+| `probable` | both agree, at least one narrowly | 25% | 69% |
+| `unsure` | they land on opposite sides of the threshold | 18% | 59% |
+
+(440 fresh LLM-AggreFact test rows; see Benchmarks.) An output takes its weakest sentence's label. `unsure` does not change `is_trustworthy`; it tells a reviewer where to look first. To make a gate stop on it, use `--fail-on-unsure` (exit code 3) or test `result.confidence`. The 0.3 margin is `thresholds["confident"]`.
 
 ## Three modes for three jobs
 
@@ -215,9 +236,12 @@ criterion verify source.txt output.txt --allow-degraded
 
 # Keep hashes only (no source/output text on disk)
 criterion verify source.txt output.txt --no-store-text
+
+# Stop when the two grounding models disagree
+criterion verify source.txt output.txt --mode rag --fail-on-unsure
 ```
 
-Exit codes: `0` = trustworthy, `2` = untrustworthy or unverified, `1` = error (including a missing grounding model).
+Exit codes: `0` = trustworthy, `2` = untrustworthy or unverified, `3` = trustworthy but unsure (only with `--fail-on-unsure`), `1` = error (including a missing grounding model).
 
 ## Python API
 
@@ -272,8 +296,19 @@ LLM-AggreFact (Tang et al., 2024) is the benchmark this field reports: eleven da
 |---------|-------------------|--------------|--------|
 | 0.4.0 | 64.8% | 61.8–67.7 | 1,650 test rows (150 per dataset) |
 | 0.5.0 | 71.8% | 67.7–75.7 | 440 fresh test rows (20 supported + 20 unsupported per dataset) |
+| 0.6.0 | 79.1% | 75.5–82.3 | 440 further fresh test rows, drawn the same way |
 
-On one shared set of 264 dev rows the gain from 0.4.0 to 0.5.0 is 9.1 points (interval 3.0–15.2). For orientation, published fixed-threshold averages on the full test set are 73.5 for MiniCheck-RoBERTa (the scorer Criterion uses), 75.0 for MiniCheck-Flan-T5, 75.6 for FactCG-DeBERTa and 75.9 for GPT-4o.
+**Do not read 71.8 → 79.1 as a seven-point gain.** The two samples are different rows, and the 0.6.0 sample is easier: MiniCheck alone, the 0.5.0 scorer, reaches 78.9% on it. Averaging in the second model added 0.2 points there (interval −2.3 to +2.7). On 528 dev rows the same change added 3.0 points (0.8 to 5.3). The honest summary is a small gain, somewhere between nothing and three points.
+
+What the second model reliably buys is the confidence label. It was designed on dev and held on the test sample:
+
+| | Dev (528 rows) | Test (440 rows) |
+|---|---|---|
+| Models agree: share of claims / verdict accuracy | 82% / 77.1% | 82% / 83.3% (79.8–86.4) |
+| Models disagree (`unsure`): accuracy | 46.1% | 59.0% (48.1–70.3) |
+| `confident`: share / accuracy | ~50% / ~84% | 58% / 89.2% (85.5–92.5) |
+
+On one shared set of 264 dev rows the gain from 0.4.0 to 0.5.0 is 9.1 points (interval 3.0–15.2). For orientation, published fixed-threshold averages on the full test set are 73.5 for MiniCheck-RoBERTa and 75.6 for FactCG-DeBERTa (the two scorers Criterion averages), 75.0 for MiniCheck-Flan-T5 and 75.9 for GPT-4o.
 
 These are **samples, not a leaderboard entry**: the full test set has 29,320 rows and would take about 37 hours on the two CPU cores this was measured on. Per-dataset results at 40 rows each are too noisy to report. The benchmark's terms allow evaluation only; no row of it was used to train or fine-tune anything, and thresholds were left at 0.5.
 
@@ -298,7 +333,7 @@ These are **samples, not a leaderboard entry**: the full test set has 29,320 row
 | HaluEval QA | 0.4.0 | 96.9% | 60.0% | 74.1% | 3 / 145 |
 | HaluEval QA | 0.5.0 | 96.7% | 75.5% | 84.8% | 4 / 145 |
 
-Two cautions. On HalluMix, 0.5.0 catches more but also flags more faithful answers (30% against 19%); lower `grounded` to trade that back. And HaluEval's errors are synthetic — the LLM-AggreFact authors left it out of their benchmark for that reason — so weigh it accordingly.
+Three cautions. These two benchmarks have not been re-run on 0.6.0. On HalluMix, 0.5.0 catches more but also flags more faithful answers (30% against 19%); lower `grounded` to trade that back. And HaluEval's errors are synthetic — the LLM-AggreFact authors left it out of their benchmark for that reason — so weigh it accordingly.
 
 ### Fragment answers and `question=`
 
@@ -311,8 +346,8 @@ Figures quoted for v0.2–v0.3.1 came from the mode-less kernel pipeline rather 
 This is an alpha release that has been through four rounds of independent adversarial auditing. Known limitations:
 
 - **NLI is optional but critical.** Without it, entity/relation/unit swaps pass undetected. Install with `[nli]`.
-- **About a quarter to a third of verdicts on hard benchmarks are wrong.** 72% balanced accuracy on LLM-AggreFact means Criterion is a reviewer's aid, not an oracle. The best published systems reach about 76–77%.
-- **Slow on CPU.** Every output sentence is scored against every chunk of the source: about 4 seconds per claim on two CPU cores for typical documents, and 13 seconds at the 95th percentile. Cost grows with (output sentences) × (source length).
+- **About a fifth to a quarter of verdicts on hard benchmarks are wrong.** 72–79% balanced accuracy on LLM-AggreFact samples means Criterion is a reviewer's aid, not an oracle. The best published systems reach about 76–77% on the full test set. Even `confident` verdicts were wrong about one time in nine.
+- **Slow on CPU.** Every output sentence is scored against every chunk of the source: with both models, about 7 seconds per claim on two CPU cores for a typical document (median), 10.5 on average and 33 at the 95th percentile. `CRITERION_SCORER=minicheck` is about three times faster and gives no confidence label. Cost grows with (output sentences) × (source length) × (models).
 - **Supported or unsupported only.** The grounding scorer has no contradiction class; "contradicts" labels come from the smaller NLI model and are less reliable than the support decision.
 - **Sentence-level.** Each output sentence is judged on its own. An error that only appears across sentences (a pronoun that now points at the wrong person) can pass.
 - **Model limits.** No world or unit knowledge beyond the source, 512-token window per chunk, English only, and it can be fooled by adversarial phrasing. Near-verbatim copies with a changed number or flipped negation are also caught deterministically.
@@ -326,7 +361,7 @@ This is an alpha release that has been through four rounds of independent advers
 
 Criterion v0.2.0–v0.3.1 was independently audited by four AI systems across six rounds. The audits identified and drove fixes for: audit-chain integrity, RAG mode crashes, batch exit codes, empty input handling, currency extraction, NLI integration, antonym detection, numeric canonicalization, and mode-specific filtering policies. The auditors' consensus at v0.3.1: "experimental developer use: viable; controlled customer pilots: conditional; high-assurance commercial release: not approved."
 
-v0.4.0 added the fixes from a further red-team pass, and v0.5.0 rebuilt the verdict around a grounding scorer after measuring on LLM-AggreFact; see [CHANGELOG.md](CHANGELOG.md). Neither has been independently reviewed.
+v0.4.0 added the fixes from a further red-team pass, and v0.5.0 rebuilt the verdict around a grounding scorer after measuring on LLM-AggreFact; and v0.6.0 added a second grounding model and the confidence label; see [CHANGELOG.md](CHANGELOG.md). None of the three has been independently reviewed.
 
 ## Requirements
 

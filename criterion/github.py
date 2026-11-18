@@ -81,6 +81,7 @@ def to_sarif(
                     "verification_method": d.verification_method,
                     "trust_score": result.trust_score,
                     "trust_level": result.trust_level,
+                    "verdict_confidence": result.confidence,
                 },
             })
 
