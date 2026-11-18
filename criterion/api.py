@@ -136,6 +136,7 @@ class VerifyResult:
                 {
                     "type": d.dtype.value,
                     "code": d.code,
+                    "alignment": d.alignment,
                     "severity": d.severity.value,
                     "explanation": d.explanation,
                     "confidence": d.confidence,
@@ -286,10 +287,16 @@ def verify(
         pair, mode=resolved_mode.value, thresholds=thresholds, question=question,
     )
     capabilities = dict(report.capabilities)
-    if require_nli and not capabilities.get("nli"):
+    # "Model-checked" means the grounding scorer ran. An NLI model alone does
+    # not count: it is several points weaker at this job, and falling back to
+    # it without saying so would be exactly the silent downgrade this guards
+    # against. (CRITERION_SCORER=nli selects it as the scorer explicitly.)
+    model_checked = bool(capabilities.get("scorer"))
+    capabilities["model_checked"] = model_checked
+    if require_nli and not model_checked:
         raise CapabilityError(
-            "The NLI model did not run "
-            f"({capabilities.get('nli_error') or 'unavailable'}), so contradictions and "
+            "The grounding model did not run "
+            f"({capabilities.get('scorer_error') or 'unavailable'}), so contradictions and "
             "fabricated claims cannot be checked. Install it with "
             "`pip install criterion-ai[nli]`, or pass require_nli=False "
             "(CLI: --allow-degraded) to run heuristics only; clean results are "
@@ -306,7 +313,9 @@ def verify(
         filtered_divs += tuple(
             Divergence(
                 dtype=DivergenceType.CONCEALING,
-                severity=Severity.MINOR,
+                # Informational: it tells the reader what the answer left
+                # behind, and must not lower the trust level by itself.
+                severity=Severity.COSMETIC,
                 source_atom=bd.source_atom,
                 output_atom=None,
                 explanation=bd.explanation,
@@ -327,13 +336,13 @@ def verify(
     maj = sum(1 for d in filtered_divs if d.severity == Severity.MAJOR)
     minor = sum(1 for d in filtered_divs if d.severity == Severity.MINOR)
     level = _classify_trust(score, crit, maj, len(filtered_bond_divs))
-    if not capabilities.get("nli") and level in (TrustLevel.FAITHFUL, TrustLevel.ADAPTED):
+    if not model_checked and level in (TrustLevel.FAITHFUL, TrustLevel.ADAPTED):
         # Heuristics found nothing blocking, but the detector that looks for
         # contradictions and fabrications never ran. That is not "faithful".
         level = TrustLevel.UNVERIFIED
     is_trust = level in (TrustLevel.FAITHFUL, TrustLevel.ADAPTED)
     summary = _build_filtered_summary(level, score, filtered_divs, filtered_bond_divs)
-    if not capabilities.get("nli"):
+    if not model_checked:
         summary += " [NLI did not run: contradictions and fabricated claims were not checked.]"
     out_text = {a.index: a.text for a in pair.output.atoms}
     sentence_support = tuple(
@@ -343,7 +352,7 @@ def verify(
     threshold_dict = {
         "grounded": thresholds.grounded, "contradiction": thresholds.contradiction,
         "fabrication": thresholds.fabrication, "equivalence": thresholds.equivalence,
-        "realign": thresholds.realign,
+        "realign": thresholds.realign, "verbatim": thresholds.verbatim,
     }
 
     # Record — store the FILTERED verdict so record matches what was returned
@@ -403,12 +412,19 @@ def _detector_config(
 ) -> dict[str, Any]:
     """What produced this verdict: detectors that ran, models, thresholds."""
     config: dict[str, Any] = {
+        "scorer": bool(capabilities.get("scorer")),
+        "scorer_error": capabilities.get("scorer_error"),
         "nli": bool(capabilities.get("nli")),
         "semantic": bool(capabilities.get("semantic")),
         "nli_error": capabilities.get("nli_error"),
         "semantic_error": capabilities.get("semantic_error"),
         "thresholds": dict(thresholds) if thresholds else None,
     }
+    try:
+        from criterion.grounding import scorer_info as _scorer_info
+        config["scorer_model"] = _scorer_info()
+    except ImportError:
+        config["scorer_model"] = None
     try:
         from criterion.nli import model_info as _nli_info
         config["nli_model"] = _nli_info()

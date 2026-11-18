@@ -214,10 +214,21 @@ class CapturedPair:
 # Decomposition engine
 # ---------------------------------------------------------------------------
 
-_SENTENCE_BOUNDARY = re.compile(
-    r"(?<=[.!?])\s+(?=[A-Z\"“(])"
-    r"|(?<=\n)\s*\n"
+# A candidate sentence boundary: terminal punctuation, optional closing
+# quotes/brackets, then whitespace. Whether it is a REAL boundary is decided
+# in _split_sentences (abbreviations, initials, tokenised text).
+_BOUNDARY_CANDIDATE = re.compile(r"([.!?][\"”’')\]]*)(\s+)")
+_PARAGRAPH_BREAK = re.compile(r"\n\s*\n")
+# Abbreviations after which a capitalised word normally continues the
+# sentence ("Dr. Smith", "the U.S. Army", "Fig. 3"). Erring toward NOT
+# splitting is the safe side: a half-sentence ("...administered by Dr.")
+# cannot be verified and would be flagged as unsupported.
+_ABBREVIATIONS = frozenset(
+    "dr mr mrs ms mx prof sr jr st mt gen col lt sgt capt cmdr maj rep sen gov pres "
+    "rev hon vs v no nos fig figs eq vol pp ed eds approx est dept inc ltd co corp "
+    "e.g i.e u.s u.k u.n a.m p.m ph.d".split()
 )
+_LAST_TOKEN = re.compile(r"(\S+)$")
 
 _HEADING_PATTERN = re.compile(r"^#{1,6}\s+.+$", re.MULTILINE)
 _LIST_ITEM_PATTERN = re.compile(r"^[\s]*[-*•]\s+.+$", re.MULTILINE)
@@ -275,10 +286,44 @@ def _classify_atom_type(text: str, kind: str) -> AtomType:
     return best
 
 
+def _is_boundary(left: str, punct: str, gap: str, right: str) -> bool:
+    """Is the punctuation at the end of `left` a real sentence boundary?"""
+    if not right:
+        return False
+    nxt = right[0]
+    if punct[0] == ".":
+        m = _LAST_TOKEN.search(left)
+        token = (m.group(1) if m else "").lstrip("(\"“‘'[").lower()
+        if token in _ABBREVIATIONS:
+            return False
+        if len(token) == 1 and token.isalpha() and left[-1:].isupper():
+            return False                      # an initial: "J. K. Rowling"
+        if token.isdigit() and left.strip() == token:
+            return False                      # a list number: "1. First item"
+    if nxt.islower():
+        # Lowercase after a full stop is a new sentence only in tokenised or
+        # line-broken text ("the trial ended . \nthe jury left").
+        return left[-1:].isspace() or "\n" in gap
+    return True
+
+
 def _split_sentences(text: str) -> list[str]:
-    """Split prose into sentences."""
-    parts = _SENTENCE_BOUNDARY.split(text)
-    return [p for p in parts if p and p.strip()]
+    """Split prose into sentences.
+
+    Handles abbreviations and initials (no split after "Dr.", "U.S.", "J."),
+    tokenised text where the full stop is set off by spaces and the next
+    sentence is lowercase, and blank-line paragraph breaks.
+    """
+    sentences: list[str] = []
+    for block in _PARAGRAPH_BREAK.split(text):
+        start = 0
+        for m in _BOUNDARY_CANDIDATE.finditer(block):
+            left = block[start:m.start()]
+            if _is_boundary(left, m.group(1), m.group(2), block[m.end():]):
+                sentences.append(block[start:m.end(1)])
+                start = m.end()
+        sentences.append(block[start:])
+    return [p for p in sentences if p and p.strip()]
 
 
 def _decompose_text(text: str) -> tuple[list[Atom], list[Bond]]:

@@ -170,8 +170,8 @@ def _print_human(result) -> None:
     if result.groundedness is not None:
         print(f"  Groundedness (weakest sentence's source support): {result.groundedness:.2f}\n")
     caps = result.capabilities
-    if caps and not caps.get("nli"):
-        print(f"  ⚠ NLI did not run ({caps.get('nli_error') or 'unavailable'}).")
+    if caps and not caps.get("model_checked"):
+        print(f"  ⚠ The grounding model did not run ({caps.get('scorer_error') or 'unavailable'}).")
         print("    Contradictions and fabricated claims were NOT checked. pip install criterion-ai[nli]\n")
 
     if result.total_divergences > 0:

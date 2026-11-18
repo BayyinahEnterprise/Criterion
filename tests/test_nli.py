@@ -128,13 +128,6 @@ class TestNLIEntailments:
         )
         assert result.is_trustworthy
 
-    @pytest.mark.xfail(
-        strict=False,
-        reason="Known limitation of the default NLI model (tasksource/deberta-base-long-nli): "
-               "it has no unit knowledge and scores '365 days' vs 'about a year' as a "
-               "contradiction (0.89). Passes with CRITERION_NLI_MODEL=cross-encoder/"
-               "nli-deberta-v3-small. Documented in README > Limitations.",
-    )
     def test_faithful_numeric_paraphrase(self):
         result = verify(
             source="The earth orbits the sun in 365 days.",

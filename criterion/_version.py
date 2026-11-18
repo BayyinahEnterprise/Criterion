@@ -5,4 +5,4 @@ reads it from here, so a record can never claim a version other than the
 code that wrote it.
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
