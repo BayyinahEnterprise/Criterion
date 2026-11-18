@@ -80,6 +80,29 @@ def _scorer_support(source_text: str, claims: list[str]) -> list[tuple[float, st
     return _grounding_mod.support(source_text, claims)
 
 
+def agreement(members: dict[str, float], grounded: float, margin: float) -> str | None:
+    """How far to trust a sentence's verdict, from how its scorers voted.
+
+      "unsure"     the models land on opposite sides of `grounded`. Measured
+                   on LLM-AggreFact dev, verdicts on such sentences were
+                   right 46% of the time: no better than a coin.
+      "confident"  they agree and each is at least `margin` clear of the
+                   threshold (about half of all claims; ~84% right).
+      "probable"   they agree, but at least one is close to the threshold.
+      None         fewer than two models scored it, so there is no second
+                   opinion to compare.
+    """
+    if len(members) < 2:
+        return None
+    values = list(members.values())
+    sides = {v >= grounded for v in values}
+    if len(sides) > 1:
+        return "unsure"
+    if all(abs(v - grounded) >= margin for v in values):
+        return "confident"
+    return "probable"
+
+
 # ---------------------------------------------------------------------------
 # Divergence taxonomy — four paired axes, eight types
 # ---------------------------------------------------------------------------
@@ -223,6 +246,9 @@ class DivergenceReport:
     # every output sentence NLI judged. Absent for fragments judged by
     # containment and whenever NLI did not run.
     support: dict[int, float] = field(default_factory=dict)
+    # Output atom index -> each grounding model's own score, when more than
+    # one model scored the sentence. Their disagreement is the "unsure" signal.
+    support_models: dict[int, dict[str, float]] = field(default_factory=dict)
 
     @property
     def total(self) -> int:
@@ -847,6 +873,7 @@ REALIGN_THRESHOLD = 0.8
 # output sentence is this close to a verbatim copy of its source sentence.
 # Below it, the check is evidence of a loose pairing, not of an error.
 VERBATIM_THRESHOLD = 0.9
+CONFIDENT_MARGIN = 0.3
 
 
 
@@ -863,6 +890,9 @@ class Thresholds:
                     `grounded`, so every unsupported sentence blocks.
     verbatim:       alignment similarity above which a deterministic check
                     may overrule the scorer's "supported".
+    confident:      how far from `grounded` every model's score must be for
+                    an agreed verdict to count as "confident" rather than
+                    "probable". Labels only; it never changes the verdict.
     """
 
     grounded: float = field(default_factory=lambda: GROUNDED_THRESHOLD)
@@ -871,9 +901,10 @@ class Thresholds:
     equivalence: float = field(default_factory=lambda: EQUIVALENCE_THRESHOLD)
     realign: float = field(default_factory=lambda: REALIGN_THRESHOLD)
     verbatim: float = field(default_factory=lambda: VERBATIM_THRESHOLD)
+    confident: float = field(default_factory=lambda: CONFIDENT_MARGIN)
 
     def __post_init__(self) -> None:
-        for name in ("grounded", "contradiction", "fabrication", "equivalence", "realign", "verbatim"):
+        for name in ("grounded", "contradiction", "fabrication", "equivalence", "realign", "verbatim", "confident"):
             value = getattr(self, name)
             if not isinstance(value, (int, float)) or not 0.0 <= value <= 1.0:
                 raise ValueError(f"threshold {name} must be between 0 and 1, got {value!r}")
@@ -1269,6 +1300,7 @@ def find_divergences(
     # The grounding scorer: P(supported) for every output sentence that makes
     # a statement, taken as the maximum over chunks of the source.
     scores: dict[int, float] = {}
+    score_models: dict[int, dict[str, float]] = {}
     if _USE_SCORER:
         # Fragments are not scored here. With a question they become
         # statements ("The answer to ... is Delhi."), and those are judged by
@@ -1279,7 +1311,11 @@ def find_divergences(
             results = _scorer_support(
                 _clean(pair.source.raw_text), [_clean(a.text) for a in judged],
             )
-            scores = {a.index: float(sc) for a, (sc, _) in zip(judged, results)}
+            scores = {a.index: float(r[0]) for a, r in zip(judged, results)}
+            score_models = {
+                a.index: {k: float(v) for k, v in r.members.items()}
+                for a, r in zip(judged, results) if len(getattr(r, "members", {})) > 1
+            }
             caps["scorer"] = True
         except Exception as e:
             caps["scorer_error"] = f"{type(e).__name__}: {e}"
@@ -1554,4 +1590,8 @@ def find_divergences(
         output_atoms_unmatched=len(unmatched_out),
         capabilities=caps,
         support={k: round(v, 4) for k, v in sorted(support.items())},
+        support_models={
+            k: {n: round(v, 4) for n, v in m.items()}
+            for k, m in sorted(score_models.items()) if scorer_ok
+        },
     )

@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.6.0 — two models and a third answer
+
+### What changed
+
+- **Two grounding models by default.** `yaxili96/FactCG-DeBERTa-v3-Large` now scores every sentence alongside MiniCheck; the verdict is decided by the average of the two. `CRITERION_SCORER=minicheck` restores the single model. Names can be joined with `+`.
+- **`result.confidence`: `confident`, `probable` or `unsure`.** `unsure` means the two models land on opposite sides of the threshold on at least one sentence. On 440 fresh test rows the verdict was right 89% of the time when `confident` (58% of claims), 69% when `probable` (25%) and 59% when `unsure` (18%). Each row of `sentence_support` carries both models' scores and its own label; `unsure_count` and the summary say how many sentences are in doubt.
+- **`unsure` does not change `is_trustworthy`.** It is a label for the reviewer. `--fail-on-unsure` makes the CLI exit 3 on it.
+- **All or nothing.** If either model cannot load, the scorer fails and `verify()` raises `CapabilityError`; it never continues with one model while reporting two.
+- **Batches are bounded by size as well as count.** Eight 2,048-token inputs in one batch exhausted memory on an 8 GB machine; long inputs now go through in small batches.
+- New threshold `confident` (default 0.3): how far from `grounded` both scores must be for `confident`.
+
+### Measured
+
+- LLM-AggreFact, 440 fresh test rows, public API: **79.1%** balanced accuracy (95% interval 75.5–82.3). This sample is easier than the one 0.5.0 was measured on; MiniCheck alone scores 78.9% on it. So the accuracy gain from averaging is 0.2 points here (−2.3 to +2.7), against 3.0 (0.8 to 5.3) on 528 dev rows. Small, and not established.
+- The confidence label is the result that held: designed on dev, confirmed on test (table in the README).
+
+### Tried and not adopted
+
+Six further ideas were tested on 528 dev rows, explored on one half and confirmed on the other. None survived:
+
+- **Perturbing the claim** (change a number, a name, a negation, and see whether the score moves): claims whose score did not move were no more often wrong.
+- **Removing the evidence** and rescoring: a weak signal in the opposite direction to the one expected; too small to use.
+- **Evidence-centred windows** in place of fixed chunks: +1.2 and +0.7 points, within noise.
+- **Blocking when a name or number in the claim is absent from the source:** names looked strong on the first half (43% against 80% correct) and vanished on the second (64% against 72%); numbers showed nothing.
+- **Scoring each sentence with the previous one for context:** no consistent effect on the 52 multi-sentence claims available.
+- **Learning the threshold per source from a dozen labelled examples:** worse than the fixed 0.5.
+
+### Costs
+
+- Download grows by ~1.7 GB.
+- About 7 seconds per claim on two CPU cores (median), 10.5 on average, 33 at the 95th percentile; roughly three times 0.5.0.
+
 ## 0.5.0 — grounding scorer
 
 v0.4.0 was measured on LLM-AggreFact, the benchmark the fact-checking field reports, and scored 64.8% balanced accuracy — below a 2021 zero-shot baseline. After reading the literature (SummaC, AlignScore, MiniCheck, FactCG, and two papers on claim decomposition) and comparing scorers on the dev split, the verdict was rebuilt. On a fresh test sample it now scores 71.8% (95% interval 67.7–75.7).

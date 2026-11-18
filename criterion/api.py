@@ -30,6 +30,7 @@ from typing import Any, Sequence
 
 from criterion.capture import capture, CapturedPair
 from criterion.divergence import (
+    agreement,
     find_divergences,
     Thresholds,
     Divergence,
@@ -113,6 +114,17 @@ class VerifyResult:
     groundedness: float | None = None
     # The thresholds this verdict was decided with.
     thresholds: dict[str, float] = field(default_factory=dict)
+    # How far to trust the verdict, when two grounding models scored it:
+    #   "confident"  they agree on every sentence, each well clear of the threshold
+    #   "probable"   they agree on every sentence, at least one of them narrowly
+    #   "unsure"     they disagree on at least one sentence — the verdict there
+    #                is no better than a coin flip and a person should look
+    #   None         only one model ran (or nothing was scored)
+    # The verdict itself is decided by the models' average either way; this
+    # says how much weight it will bear. Each sentence's own label and both
+    # scores are in sentence_support.
+    confidence: str | None = None
+    unsure_count: int = 0
 
     def to_dict(self) -> dict:
         """Serialize to a dictionary for JSON output."""
@@ -132,6 +144,8 @@ class VerifyResult:
             "groundedness": self.groundedness,
             "sentence_support": list(self.sentence_support),
             "thresholds": dict(self.thresholds),
+            "confidence": self.confidence,
+            "unsure_count": self.unsure_count,
             "divergences": [
                 {
                     "type": d.dtype.value,
@@ -345,14 +359,37 @@ def verify(
     if not model_checked:
         summary += " [NLI did not run: contradictions and fabricated claims were not checked.]"
     out_text = {a.index: a.text for a in pair.output.atoms}
+    def _sentence(i: int, sc: float) -> dict[str, Any]:
+        row: dict[str, Any] = {"text": out_text[i], "support": sc}
+        models = report.support_models.get(i)
+        if models:
+            row["models"] = dict(models)
+            row["confidence"] = agreement(models, thresholds.grounded, thresholds.confident)
+        return row
+
     sentence_support = tuple(
-        {"text": out_text[i], "support": sc} for i, sc in report.support.items() if i in out_text
+        _sentence(i, sc) for i, sc in report.support.items() if i in out_text
     )
     groundedness = min((x["support"] for x in sentence_support), default=None)
+    labels = [x["confidence"] for x in sentence_support if x.get("confidence")]
+    unsure_count = labels.count("unsure")
+    confidence = (
+        None if not labels or not model_checked
+        else "unsure" if unsure_count
+        else "probable" if "probable" in labels
+        else "confident"
+    )
+    if unsure_count:
+        summary += (
+            f" [Unsure: the two grounding models disagree on {unsure_count} "
+            f"sentence{'s' if unsure_count != 1 else ''}; a person should check "
+            f"{'them' if unsure_count != 1 else 'it'}.]"
+        )
     threshold_dict = {
         "grounded": thresholds.grounded, "contradiction": thresholds.contradiction,
         "fabrication": thresholds.fabrication, "equivalence": thresholds.equivalence,
         "realign": thresholds.realign, "verbatim": thresholds.verbatim,
+        "confident": thresholds.confident,
     }
 
     # Record — store the FILTERED verdict so record matches what was returned
@@ -404,6 +441,8 @@ def verify(
         sentence_support=sentence_support,
         groundedness=groundedness,
         thresholds=threshold_dict,
+        confidence=confidence,
+        unsure_count=unsure_count,
     )
 
 
