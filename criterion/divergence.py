@@ -67,6 +67,18 @@ try:
 except ImportError:
     _USE_NLI = False
 
+# Grounding scorer — decides whether each output sentence is supported
+_USE_SCORER = True
+try:
+    from criterion import grounding as _grounding_mod
+except ImportError:
+    _USE_SCORER = False
+
+
+def _scorer_support(source_text: str, claims: list[str]) -> list[tuple[float, str]]:
+    """Indirection so tests can stub the scorer."""
+    return _grounding_mod.support(source_text, claims)
+
 
 # ---------------------------------------------------------------------------
 # Divergence taxonomy — four paired axes, eight types
@@ -155,6 +167,9 @@ class Divergence:
     # "ungrounded"). Policy decisions key off this, never off the
     # human-readable explanation text.
     code: str = ""
+    # Character similarity (0-1) between the aligned source and output
+    # sentences, when the finding comes from an aligned pair.
+    alignment: float | None = None
 
     @property
     def pair(self) -> str:
@@ -818,12 +833,20 @@ def _find_broken_bonds(
 GROUNDED_THRESHOLD = 0.5
 # Contradiction must clear this to be reported (same bar as matched pairs).
 CONTRADICTION_THRESHOLD = 0.7
-# Below this best-entailment, an unsupported claim is CRITICAL, not MAJOR.
-FABRICATION_THRESHOLD = 0.2
+# Below this support, an unsupported sentence is CRITICAL (blocks trust on its
+# own) rather than MAJOR. Equal to GROUNDED_THRESHOLD by default, so every
+# unsupported sentence blocks — the published single-threshold protocol.
+# Lower it to let weakly supported sentences through as MAJOR findings.
+FABRICATION_THRESHOLD = 0.5
 # Both directions must entail at >= this for lexical heuristics to stand down.
 EQUIVALENCE_THRESHOLD = 0.9
 # A single other atom must entail at >= this to re-align a matched pair.
 REALIGN_THRESHOLD = 0.8
+# A deterministic check (changed number, flipped negation, role swap) or a
+# pairwise contradiction can overrule the scorer's "supported" only when the
+# output sentence is this close to a verbatim copy of its source sentence.
+# Below it, the check is evidence of a loose pairing, not of an error.
+VERBATIM_THRESHOLD = 0.9
 
 
 
@@ -835,9 +858,11 @@ class Thresholds:
                     it at >= this. Raise it to demand stronger support (more
                     flags); lower it to accept weaker support (fewer flags).
     contradiction:  NLI contradiction must reach this to be reported.
-    fabrication:    below this best-support, an unsupported sentence is
-                    CRITICAL (blocks trust on its own) rather than MAJOR.
-                    This is the main precision/recall dial for RAG.
+    fabrication:    below this support, an unsupported sentence is CRITICAL
+                    (blocks trust on its own) rather than MAJOR. Defaults to
+                    `grounded`, so every unsupported sentence blocks.
+    verbatim:       alignment similarity above which a deterministic check
+                    may overrule the scorer's "supported".
     """
 
     grounded: float = field(default_factory=lambda: GROUNDED_THRESHOLD)
@@ -845,9 +870,10 @@ class Thresholds:
     fabrication: float = field(default_factory=lambda: FABRICATION_THRESHOLD)
     equivalence: float = field(default_factory=lambda: EQUIVALENCE_THRESHOLD)
     realign: float = field(default_factory=lambda: REALIGN_THRESHOLD)
+    verbatim: float = field(default_factory=lambda: VERBATIM_THRESHOLD)
 
     def __post_init__(self) -> None:
-        for name in ("grounded", "contradiction", "fabrication", "equivalence", "realign"):
+        for name in ("grounded", "contradiction", "fabrication", "equivalence", "realign", "verbatim"):
             value = getattr(self, name)
             if not isinstance(value, (int, float)) or not 0.0 <= value <= 1.0:
                 raise ValueError(f"threshold {name} must be between 0 and 1, got {value!r}")
@@ -1034,6 +1060,7 @@ def _unsupported(
     """An output claim that NLI finds no support for anywhere relevant in the source."""
     fabricated = entailment < fabrication
     where = "within this sentence" if source is not None else "in this sentence"
+    entailment = float(entailment)
     return Divergence(
         dtype=DivergenceType.ADDITION,
         severity=Severity.CRITICAL if fabricated else Severity.MAJOR,
@@ -1053,6 +1080,77 @@ def _unsupported(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+# Findings that claim "the source does not support this sentence". When the
+# grounding scorer ran, it is the authority on that question.
+_SUPPORT_CODES = frozenset({"ungrounded", "unsupported_detail", "contradicts_source"})
+# Findings from comparing one output sentence with ONE aligned source
+# sentence. Precise when the pair is near-verbatim; unreliable when the
+# pairing is loose (a summary sentence is not wrong for differing from
+# whichever source sentence it happens to resemble).
+_PAIRWISE_CODES = frozenset({
+    "numeric_change", "numeric_dropped", "negation", "antonym", "role_swap", "nli_contradiction",
+})
+
+
+def _arbitrate(
+    divergences: list[Divergence],
+    scores: dict[int, float],
+    partners: dict[int, tuple[Atom, float]],
+    outputs: dict[int, Atom],
+    t: Thresholds,
+) -> list[Divergence]:
+    """Reconcile the pipeline's findings with the grounding scorer.
+
+    For each output sentence the scorer judged:
+      supported (score >= grounded)
+          - "unsupported"/"contradicts" findings from the NLI pipeline are
+            dropped: the scorer overrules them.
+          - pairwise findings stand only if the pair is near-verbatim
+            (alignment >= verbatim); otherwise they are kept as MINOR notes.
+      unsupported (score < grounded)
+          - existing findings stay and explain the failure; if there is
+            none, an "ungrounded" finding is added.
+          - severity is CRITICAL below `fabrication`, MAJOR otherwise.
+    Measured on LLM-AggreFact: letting the pairwise checks block on their own
+    lowered accuracy with every scorer tried, hence the verbatim gate.
+    """
+    result: list[Divergence] = []
+    explained: set[int] = set()
+    for d in divergences:
+        out = d.output_atom
+        arbitrated = d.code in _SUPPORT_CODES or d.code in _PAIRWISE_CODES
+        if out is None or out.index not in scores or not arbitrated:
+            result.append(d)
+            continue
+        score = scores[out.index]
+        alignment = partners.get(out.index, (None, None))[1]
+        if score >= t.grounded:
+            if d.code in _SUPPORT_CODES:
+                continue
+            if alignment is not None and alignment >= t.verbatim:
+                result.append(replace(d, alignment=alignment))
+                explained.add(out.index)
+            else:
+                result.append(replace(
+                    d, severity=Severity.MINOR, confidence=min(d.confidence, 0.3),
+                    alignment=alignment,
+                    explanation=d.explanation + f" — but the sentence is supported by the source overall (support {score:.0%})",
+                ))
+            continue
+        severity = Severity.CRITICAL if score < t.fabrication else Severity.MAJOR
+        if d.code in _SUPPORT_CODES and d.severity != Severity.CRITICAL:
+            d = replace(d, severity=severity)
+        if d.code in _SUPPORT_CODES:
+            d = replace(d, confidence=round(max(1.0 - score, 0.5), 4))
+        result.append(replace(d, alignment=alignment))
+        explained.add(out.index)
+    for index, score in scores.items():
+        if score < t.grounded and index not in explained and index in outputs:
+            partner = partners.get(index, (None, None))[0]
+            result.append(_unsupported(partner, outputs[index], score, t.fabrication))
+    return result
+
 
 _MODES = (None, "strict", "rag", "summary")
 
@@ -1100,6 +1198,7 @@ def find_divergences(
     source_atoms = pair.source.atoms
     output_atoms = pair.output.atoms
     caps: dict[str, Any] = {
+        "scorer": False, "scorer_error": None if _USE_SCORER else "criterion.grounding not importable",
         "nli": False, "semantic": False,
         "nli_error": None if _USE_NLI else "criterion.nli not importable",
         "semantic_error": None if _USE_SEMANTIC else "criterion.semantic not importable",
@@ -1167,12 +1266,40 @@ def find_divergences(
         {a.index: _as_statement(question, a.text) for a in unmatched_out if a.index in fragments}
         if question else {}
     )
+    # The grounding scorer: P(supported) for every output sentence that makes
+    # a statement, taken as the maximum over chunks of the source.
+    scores: dict[int, float] = {}
+    if _USE_SCORER:
+        # Fragments are not scored here. With a question they become
+        # statements ("The answer to ... is Delhi."), and those are judged by
+        # the NLI model below: measured on answer fragments, the grounding
+        # scorer rejected 82% of CORRECT answers phrased that way.
+        judged = [a for a in output_atoms if a.index not in fragments]
+        try:
+            results = _scorer_support(
+                _clean(pair.source.raw_text), [_clean(a.text) for a in judged],
+            )
+            scores = {a.index: float(sc) for a, (sc, _) in zip(judged, results)}
+            caps["scorer"] = True
+        except Exception as e:
+            caps["scorer_error"] = f"{type(e).__name__}: {e}"
+    scorer_ok = caps["scorer"]
+
     grounding: dict[int, _Grounding] = {}
     if nli_ok:
         need = [a for a in unmatched_out if a.index not in unjudgeable] + [
             out for (_, out, _), f in zip(matched, fwd)
             if f.entailment < t.grounded and out.index not in fragments
         ]
+        if scorer_ok and mode != "strict":
+            # The scorer has already decided what is supported. NLI is only
+            # needed to say WHY a failed sentence fails (contradiction or no
+            # support). Strict mode still grounds everything, because it also
+            # uses the result to decide which source sentences were omitted.
+            need = [
+                a for a in need
+                if a.index in statements or scores.get(a.index, 0.0) < t.grounded
+            ]
         try:
             grounding = _ground(need, source_atoms, statements)
         except Exception as e:
@@ -1303,8 +1430,12 @@ def find_divergences(
                 divergences.append(div)
             continue
         g = grounding.get(atom.index) if nli_ok else None
+        if g is None and scorer_ok and atom.index in scores:
+            if scores[atom.index] < t.grounded:
+                divergences.append(_unsupported(None, atom, scores[atom.index], t.fabrication))
+            continue                         # the scorer decides; see _arbitrate
         if g is None:
-            pending_additions.append(atom)   # no NLI: legacy handling below
+            pending_additions.append(atom)   # no model at all: legacy handling below
             continue
         if g.entailment >= t.grounded:
             # Some source passage supports this — a paraphrase that alignment
@@ -1324,6 +1455,15 @@ def find_divergences(
         # blocks when its support is below the fabrication threshold.
         bar = t.grounded if atom.index in statements else t.fabrication
         divergences.append(_unsupported(None, atom, g.entailment, bar))
+
+    if scorer_ok:
+        divergences = _arbitrate(
+            divergences, scores, {out.index: (src, sim) for src, out, sim in matched},
+            {a.index: a for a in output_atoms}, t,
+        )
+        # Scorer scores for sentences; NLI support is kept only for fragment
+        # answers judged through their question.
+        support = {**{k: v for k, v in support.items() if k in statements}, **scores}
 
     # Source atoms still unaccounted for. With NLI, check whether the output
     # states them somewhere alignment did not look (merged/reworded sentences).

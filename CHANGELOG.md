@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.5.0 — grounding scorer
+
+v0.4.0 was measured on LLM-AggreFact, the benchmark the fact-checking field reports, and scored 64.8% balanced accuracy — below a 2021 zero-shot baseline. After reading the literature (SummaC, AlignScore, MiniCheck, FactCG, and two papers on claim decomposition) and comparing scorers on the dev split, the verdict was rebuilt. On a fresh test sample it now scores 71.8% (95% interval 67.7–75.7).
+
+### What changed
+
+- **A grounding-trained model now decides support.** New module `criterion/grounding.py`: each output sentence gets P(supported), the maximum over ~400-token chunks of the source, from `lytang/MiniCheck-RoBERTa-Large` (MIT). This is the method the literature converged on. `CRITERION_SCORER=factcg` or `nli` select alternatives.
+- **Why not keep generic NLI:** on 264 dev rows the NLI model scored 66.7% with the same chunk-and-max recipe, MiniCheck 74.2% and FactCG 75.0%. MiniCheck's own ablation puts NLI-only training about fifteen points below grounding data.
+- **Deterministic checks no longer block on a loose pairing.** A changed number, flipped negation, role swap or pairwise contradiction overrules the scorer only when the output sentence is a near-verbatim copy of a source sentence (alignment ≥ 0.9, `thresholds["verbatim"]`). Otherwise it is kept as a MINOR note. Measured: in v0.4.0 the "number dropped" rule was right 14% of the time on dev and "number changed" 40%; letting any of these rules block on top of either grounding model lowered accuracy.
+- **Every unsupported sentence blocks by default.** `fabrication` now defaults to 0.5, equal to `grounded` (it was 0.2, which let 40% of unsupported claims through as non-blocking "major" findings).
+- **The NLI model is now a labeller.** It says whether a failed sentence contradicts the source, serves strict-mode omission checks, and judges fragment answers given a `question`. (The grounding scorer was tried for question-phrased fragments and rejected 82% of correct answers, so those stay with NLI.)
+- **Fail-closed means the scorer.** `verify()` raises `CapabilityError` unless the grounding scorer ran; a working NLI model alone is not a model-checked verdict. `capabilities` gains `scorer`, `scorer_error` and `model_checked`.
+- **Sentence splitter fixed.** It split after "Dr." ("…administered by Dr." / "Conrad Murray…") and did not split tokenised lowercase text at all, which turned an entire article into one "sentence". Abbreviations, initials, list numbers and ` . ` boundaries are now handled.
+- **The source is chunked from raw text**, and a run longer than a chunk is cut by length instead of being truncated away.
+- **No pickle.** MiniCheck's authors ship `pytorch_model.bin`. Criterion pins the Hub's safetensors conversion (`refs/pr/1`, commit `b773ffe2`), checked tensor-for-tensor against the original, and loads with `use_safetensors=True`.
+- RAG "evidence not carried" notes are now COSMETIC: informational notes must not lower the trust level. (The 71.8% figure was measured just before this change; it affects one of the 440 rows.)
+- `Divergence.alignment`: the character similarity of the aligned pair a finding came from.
+
+### Decided against, with reasons
+
+- **Claim decomposition.** MiniCheck measured it at −1.4 to +1.2 points for 2–4× the inference cost, and every decomposition method in the literature that works needs an LLM.
+- **MiniCheck-Flan-T5 and Bespoke-MiniCheck-7B.** The first is 3.1 GB and was too slow to evaluate here; the second declares no licence.
+- **Per-dataset threshold tuning.** It is how some published headline numbers are obtained; Criterion reports the fixed 0.5 threshold.
+
+### Costs
+
+- Download grows by ~1.4 GB (both models are now used).
+- About 4 seconds per claim on two CPU cores (1.4 s in v0.4.0), 13 s at the 95th percentile.
+- On HalluMix, more hallucinations are caught (96% against 89%) and more faithful answers are flagged (30% against 19%).
+
 ## 0.4.0 — red-team hardening
 
 Every item below was reproduced against v0.3.1 first and is pinned by a test in `tests/test_redteam.py`.

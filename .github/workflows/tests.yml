@@ -38,7 +38,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: hf-${{ hashFiles('criterion/nli.py', 'criterion/semantic.py') }}
+          key: hf-${{ hashFiles('criterion/nli.py', 'criterion/semantic.py', 'criterion/grounding.py') }}
       - name: Install (CPU PyTorch + all extras)
         run: |
           pip install torch --index-url https://download.pytorch.org/whl/cpu

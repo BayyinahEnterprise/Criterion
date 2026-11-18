@@ -75,6 +75,7 @@ def to_sarif(
                     # suggestion belongs in properties.
                     "suggested_correction": d.suggested_correction[:200],
                     "code": d.code,
+                    "model_checked": bool(result.capabilities.get("model_checked")),
                     "nli_ran": bool(result.capabilities.get("nli")),
                     "confidence": d.confidence,
                     "verification_method": d.verification_method,

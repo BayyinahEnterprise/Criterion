@@ -191,6 +191,7 @@ def test_result_reports_which_detectors_ran():
 def test_missing_nli_fails_closed_by_default(monkeypatch):
     import criterion.divergence as dv
     monkeypatch.setattr(dv, "_USE_NLI", False)
+    monkeypatch.setattr(dv, "_USE_SCORER", False)
     monkeypatch.delenv("CRITERION_REQUIRE_NLI", raising=False)
     with pytest.raises(CapabilityError):
         check("The sky is blue.", "The sky is blue.")
@@ -200,6 +201,7 @@ def test_missing_nli_fails_closed_by_default(monkeypatch):
 def test_degraded_mode_is_opt_in_and_never_trustworthy(monkeypatch):
     import criterion.divergence as dv
     monkeypatch.setattr(dv, "_USE_NLI", False)
+    monkeypatch.setattr(dv, "_USE_SCORER", False)
     monkeypatch.delenv("CRITERION_REQUIRE_NLI", raising=False)
     r = check("The sky is blue.", "The sky is blue.", require_nli=False)
     assert r.capabilities["nli"] is False
@@ -439,6 +441,7 @@ def test_strict_mode_reports_lost_precision():
 def test_role_swaps_are_caught_without_any_model(monkeypatch):
     import criterion.divergence as dv
     monkeypatch.setattr(dv, "_USE_NLI", False)
+    monkeypatch.setattr(dv, "_USE_SCORER", False)
     monkeypatch.setattr(dv, "_USE_SEMANTIC", False)
     for source, output in [
         ("The dosage is 5 mg and the limit is 10 mg.", "The dosage is 10 mg and the limit is 5 mg."),
