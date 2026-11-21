@@ -6,7 +6,7 @@ Criterion is a trust layer for AI-generated content. It decomposes text into sem
 
 No API keys. No external services. Runs locally.
 
-> **Status: Alpha (v0.6.0).** Suitable for developer evaluation and assisted review. Not yet validated for autonomous high-stakes trust decisions. See [Limitations](#limitations) for what it catches and what it misses.
+> **Status: Alpha (v0.7.0).** Suitable for developer evaluation and assisted review. Not yet validated for autonomous high-stakes trust decisions. See [Limitations](#limitations) for what it catches and what it misses.
 
 ## Install
 
@@ -84,7 +84,7 @@ Two grounding models score every sentence. Their average decides the verdict; wh
 ```python
 result.confidence          # "confident" | "probable" | "unsure" | None (one model only)
 result.unsure_count        # sentences the two models disagree on
-result.sentence_support    # each row also carries "models": {"minicheck": .., "factcg": ..} and "confidence"
+result.sentence_support    # each row also carries "models": {"minicheck": .., "factcg": ..}, "confidence" and "evidence"
 ```
 
 | Label | Meaning | Share of claims | Verdict was right |
@@ -260,6 +260,10 @@ print(result.to_dict())
 # SARIF output for GitHub Code Scanning
 from criterion.github import write_sarif
 write_sarif(results, "criterion.sarif")
+
+# Reviewer workflow (see "Review" below)
+from criterion import review
+review.queue(); review.stats()
 ```
 
 ## How it works
@@ -282,7 +286,33 @@ By default every `verify()` call appends an entry (including the full source and
 | `CRITERION_RECORD_KEY` set | The above, plus a rewrite by anyone who lacks the key (HMAC-SHA256 per entry). |
 | `--expect-head` / `--expect-count` | The above, plus truncation — provided you store the head id and count somewhere the writer cannot reach. `criterion chain` prints both. |
 
-Each entry records the mode, the Criterion version that wrote it, and a `detector_config` (which detectors ran, model names and pinned revisions, thresholds). Appends take a file lock, and Criterion refuses to append after a corrupt last line rather than silently starting a new chain. Ledgers written by v0.3.1 and earlier still verify.
+Each entry records the mode, the Criterion version that wrote it, and a `detector_config` (which detectors ran, model names and pinned revisions, thresholds). Appends take a file lock, and Criterion refuses to append after a corrupt last line rather than silently starting a new chain. Ledgers written by any earlier version still verify.
+
+From v0.7.0 each entry also records every judged sentence: its support score, each model's own score, the confidence label, and (unless `store_text=False`) the sentence and the source passage that supported it best. These are what a reviewer is later shown.
+
+## Review: a person where the machine is weakest
+
+About one verdict in five is wrong, so someone has to look at some of them. `criterion review` decides which, records what the person concluded, and keeps score.
+
+```bash
+criterion review queue                      # what needs a person, most doubtful first
+criterion review walk --reviewer "Aisha"    # go through it: [s]upported / [u]nsupported / [?] unclear
+criterion review decide 86bd62e8 unsupported --sentence 2 --reviewer "Aisha" --note "cost is never mentioned"
+criterion review stats                      # how often machine and reviewers agreed, by confidence label
+```
+
+```python
+from criterion import review
+items = review.queue()                                        # ReviewItem: text, evidence, support, models, confidence
+review.decide(items[0].entry_id, "unsupported", "Aisha", sentence=items[0].sentence)
+review.stats()
+```
+
+- **Order.** `unsure` first, then `probable`, then `confident`; within each, the score nearest the threshold first. That is the order of the machine's measured reliability (59%, 69%, 89%), reversed.
+- **What is queued.** Every sentence the machine did not clear, and every sentence it cleared without being `confident`. Confident, supported sentences are left out except for a spot-check sample (`--spot-check`, default 5%), chosen by hash so the same record always gives the same sample. Without that sample the error rate of confident verdicts on your data could never be measured.
+- **A decision never changes a verdict.** It is a new entry in the same hash chain that names the verdict it concerns and repeats its source and output hashes. `criterion chain` rejects a decision that has been edited, points at no earlier verdict, or is bound to different text. Deciding again appends again; the later decision is the one `stats` counts and the earlier one stays in the record.
+- **What it proves, and what it does not.** That a decision was recorded at that position and not altered since. Not who made it: the reviewer's name is whatever was typed. With `CRITERION_RECORD_KEY`, that the entry was written by someone holding the key.
+- **`stats` is not a random sample.** Doubtful sentences are reviewed first, so agreement on `unsure` and `probable` describes those groups, and only the spot-checked share speaks for `confident` verdicts in general.
 
 ## Benchmarks
 
@@ -329,11 +359,15 @@ These are **samples, not a leaderboard entry**: the full test set has 29,320 row
 | HalluMix | 0.3.1 | 86.7% | 13.1% | 22.8% | 4 / 102 |
 | HalluMix | 0.4.0 | 90.3% | 89.4% | 89.8% | 19 / 102 |
 | HalluMix | 0.5.0 | 86.0% | 96.0% | 90.7% | 31 / 102 |
+| HalluMix | 0.6.0 | 85.5% | 98.0% | 91.3% | 33 / 102 |
 | HaluEval QA | 0.3.1 | 85.7% | 7.7% | 14.2% | 2 / 145 |
 | HaluEval QA | 0.4.0 | 96.9% | 60.0% | 74.1% | 3 / 145 |
 | HaluEval QA | 0.5.0 | 96.7% | 75.5% | 84.8% | 4 / 145 |
+| HaluEval QA | 0.6.0 | 96.7% | 76.8% | 85.6% | 4 / 145 |
 
-Three cautions. These two benchmarks have not been re-run on 0.6.0. On HalluMix, 0.5.0 catches more but also flags more faithful answers (30% against 19%); lower `grounded` to trade that back. And HaluEval's errors are synthetic — the LLM-AggreFact authors left it out of their benchmark for that reason — so weigh it accordingly.
+The second model changed little here: 0.6.0 differs from 0.5.0 by a handful of rows on either dataset. The confidence label again separated good verdicts from doubtful ones — on HalluMix the verdict was right for 92% of `confident` outputs (204), 78% of `probable` (51) and 72% of `unsure` (32); on HaluEval, where half the answers are fragments the label does not cover, 88%, 57% and 47% (94, 37 and 19 outputs).
+
+Two cautions. On HalluMix, 0.5.0 and 0.6.0 catch more than 0.4.0 but also flag more faithful answers (about 31% against 19%); lower `grounded` to trade that back. And HaluEval's errors are synthetic — the LLM-AggreFact authors left it out of their benchmark for that reason — so weigh it accordingly.
 
 ### Fragment answers and `question=`
 
@@ -361,7 +395,7 @@ This is an alpha release that has been through four rounds of independent advers
 
 Criterion v0.2.0–v0.3.1 was independently audited by four AI systems across six rounds. The audits identified and drove fixes for: audit-chain integrity, RAG mode crashes, batch exit codes, empty input handling, currency extraction, NLI integration, antonym detection, numeric canonicalization, and mode-specific filtering policies. The auditors' consensus at v0.3.1: "experimental developer use: viable; controlled customer pilots: conditional; high-assurance commercial release: not approved."
 
-v0.4.0 added the fixes from a further red-team pass, and v0.5.0 rebuilt the verdict around a grounding scorer after measuring on LLM-AggreFact; and v0.6.0 added a second grounding model and the confidence label; see [CHANGELOG.md](CHANGELOG.md). None of the three has been independently reviewed.
+v0.4.0 added the fixes from a further red-team pass, and v0.5.0 rebuilt the verdict around a grounding scorer after measuring on LLM-AggreFact; v0.6.0 added a second grounding model and the confidence label, and v0.7.0 the reviewer workflow; see [CHANGELOG.md](CHANGELOG.md). None of the four has been independently reviewed.
 
 ## Requirements
 
