@@ -365,6 +365,9 @@ def verify(
         if models:
             row["models"] = dict(models)
             row["confidence"] = agreement(models, thresholds.grounded, thresholds.confident)
+        evidence = report.support_evidence.get(i)
+        if evidence:
+            row["evidence"] = evidence
         return row
 
     sentence_support = tuple(
@@ -414,6 +417,7 @@ def verify(
             mode=resolved_mode.value,
             detector_config=_detector_config(capabilities, threshold_dict),
             store_text=store_text,
+            sentences=sentence_support,
         )
         record_id = entry.entry_id
 

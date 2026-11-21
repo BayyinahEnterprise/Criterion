@@ -111,7 +111,51 @@ def main(argv: list[str] | None = None) -> int:
     batch_p.add_argument("--record", default=None, help="Path to the record file.")
     _add_policy_flags(batch_p)
 
+    # review
+    review_p = sub.add_parser(
+        "review", help="Put doubtful verdicts in front of a person and record what they decide.",
+    )
+    review_sub = review_p.add_subparsers(dest="review_command")
+
+    def _queue_flags(p) -> None:
+        p.add_argument("--record", default=None, help="Path to the record file.")
+        p.add_argument("--spot-check", type=float, default=0.05, metavar="SHARE",
+                       help="Share (0-1) of confident, supported sentences to include anyway, "
+                            "so the machine's confident verdicts get measured too (default 0.05).")
+        p.add_argument("--all", action="store_true", help="Queue every recorded sentence.")
+        p.add_argument("--limit", type=int, default=None, help="Show at most this many.")
+
+    q_p = review_sub.add_parser("queue", help="List what needs a person, most doubtful first.")
+    _queue_flags(q_p)
+    q_p.add_argument("--json", action="store_true", help="One JSON object per line.")
+
+    w_p = review_sub.add_parser("walk", help="Go through the queue and decide, one sentence at a time.")
+    _queue_flags(w_p)
+    w_p.add_argument("--reviewer", required=True, help="Your name, as it should appear in the record.")
+
+    d_p = review_sub.add_parser("decide", help="Record one decision.")
+    d_p.add_argument("entry", help="Entry id of the verdict (at least the first 8 characters).")
+    d_p.add_argument("decision", choices=["supported", "unsupported", "unclear"])
+    d_p.add_argument("--sentence", type=int, default=None, help="Sentence number, as shown in the queue.")
+    d_p.add_argument("--reviewer", required=True)
+    d_p.add_argument("--note", default="")
+    d_p.add_argument("--record", default=None, help="Path to the record file.")
+
+    s_p = review_sub.add_parser("stats", help="How often the machine and the reviewers agreed.")
+    s_p.add_argument("--record", default=None, help="Path to the record file.")
+    s_p.add_argument("--json", action="store_true")
+
     args = parser.parse_args(argv)
+
+    if args.command == "review":
+        if not args.review_command:
+            review_p.print_help()
+            return 1
+        try:
+            return _run_review(args)
+        except (ValueError, RecordCorruptError, FileNotFoundError) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
 
     if args.command is None or args.command == "verify":
         if not hasattr(args, "source"):
@@ -166,6 +210,98 @@ def main(argv: list[str] | None = None) -> int:
 
     parser.print_help()
     return 1
+
+
+def _show_item(item, position: str = "") -> None:
+    where = "whole output" if item.sentence is None else f"sentence {item.sentence}"
+    print(f"\n{position}{item.entry_id[:12]}  {where}  [{item.mode}]")
+    scores = ""
+    if item.models:
+        scores = "  (" + ", ".join(f"{k} {v:.2f}" for k, v in item.models.items()) + ")"
+    support = "n/a" if item.support is None else f"{item.support:.2f}"
+    print(f"  Machine: {item.machine}, {item.confidence or 'no confidence label'} — support {support}{scores}")
+    print(f"  Queued because: {item.reason}")
+    print(f"  Claim:    {item.text if item.text is not None else '(text was not stored in this record)'}")
+    if item.evidence:
+        print(f"  Evidence: {item.evidence}")
+    elif item.text is not None:
+        print("  Evidence: (no passage recorded)")
+
+
+def _run_review(args) -> int:
+    from criterion import review
+
+    if args.review_command == "stats":
+        result = review.stats(args.record)
+        if args.json:
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            return 0
+        print(f"\n  {result['reviewed']} of {result['sentences']} recorded sentences reviewed; "
+              f"{result['pending_in_default_queue']} waiting in the queue.\n")
+        print(f"  {'Machine said':14s}{'sentences':>10s}{'reviewed':>10s}{'agreed':>8s}{'disagreed':>11s}{'unclear':>9s}{'agreement':>11s}")
+        for label, row in result["by_confidence"].items():
+            rate = "—" if row["agreement"] is None else f"{100 * row['agreement']:.0f}%"
+            print(f"  {label:14s}{row['sentences']:>10d}{row['reviewed']:>10d}{row['agreed']:>8d}"
+                  f"{row['disagreed']:>11d}{row['unclear']:>9d}{rate:>11s}")
+        print("\n  Reviewed sentences are the doubtful ones first, not a random sample: only the\n"
+              "  spot-checked share speaks for confident verdicts in general.\n")
+        return 0
+
+    if args.review_command == "decide":
+        entry = review.decide(
+            args.entry, args.decision, args.reviewer,
+            sentence=args.sentence, note=args.note, record_path=args.record,
+        )
+        print(f"✓ recorded: {entry.summary}  ({entry.entry_id[:12]})")
+        return 0
+
+    items = review.queue(args.record, spot_check=args.spot_check, everything=args.all)
+    if args.limit is not None:
+        items = items[:max(0, args.limit)]
+
+    if args.review_command == "queue":
+        if args.json:
+            for item in items:
+                print(json.dumps(item.to_dict(), ensure_ascii=False))
+            return 0
+        if not items:
+            print("Nothing is waiting for review.")
+            return 0
+        for n, item in enumerate(items, 1):
+            _show_item(item, f"[{n}/{len(items)}] ")
+        print(f"\n  {len(items)} waiting. Decide with: criterion review walk --reviewer NAME")
+        return 0
+
+    # walk
+    if not items:
+        print("Nothing is waiting for review.")
+        return 0
+    keys = {"s": "supported", "u": "unsupported", "?": "unclear"}
+    done = 0
+    for n, item in enumerate(items, 1):
+        _show_item(item, f"[{n}/{len(items)}] ")
+        while True:
+            try:
+                answer = input("  Does the source support the claim?  [s]upported  [u]nsupported  [?] unclear  [n]ext  [q]uit > ").strip().lower()
+            except EOFError:
+                answer = "q"
+            if answer in keys or answer in ("n", "q", ""):
+                break
+        if answer == "q":
+            break
+        if answer in ("n", ""):
+            continue
+        try:
+            note = input("  Note (optional) > ").strip()
+        except EOFError:
+            note = ""
+        review.decide(
+            item.entry_id, keys[answer], args.reviewer,
+            sentence=item.sentence, note=note, record_path=args.record,
+        )
+        done += 1
+    print(f"\n  {done} decision{'s' if done != 1 else ''} recorded.")
+    return 0
 
 
 def _exit_code(result, args) -> int:

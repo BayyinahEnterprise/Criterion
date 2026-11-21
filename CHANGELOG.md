@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.7.0 — the reviewer workflow
+
+0.6.0 can say which verdicts not to rely on. This release does something with that: it puts those sentences in front of a person, records what the person decided in the same tamper-evident record, and reports how often the two agreed.
+
+### What changed
+
+- **`criterion review queue | walk | decide | stats`**, and `criterion.review` in Python. The queue runs from the machine's least reliable verdicts to its most: `unsure`, `probable`, then `confident`. Each item shows the sentence, the source passage that supported it best, both models' scores and why it was queued.
+- **Spot checks.** Confident, supported sentences are left out of the queue except for a sample (default 5%), chosen by hash so it is reproducible. This is what makes the error rate of confident verdicts measurable on a deployment's own data.
+- **Decisions are entries in the hash chain.** A decision names the verdict it concerns and repeats its source and output hashes. The verdict is never modified. `verify_chain` rejects a decision that was edited, that points at no earlier verdict, that is bound to different text, or that names a sentence the verdict does not have.
+- **The record now holds each judged sentence**: support, each model's score, confidence label, and hashes of the sentence and its evidence passage. The sentence and passage themselves are stored alongside unless `store_text=False`, bound by hash like the source and output, so they can be redacted later without breaking the chain.
+- **Hash scheme 3.** New entries are hashed over the extended field list. The field list of scheme 2 (0.4.0 to 0.6.0) is frozen, so existing ledgers verify unchanged and are extended in place; a scheme-2 entry that carries the new, unprotected fields is rejected.
+- `sentence_support` rows gain `evidence`.
+
+### Limits, stated plainly
+
+- The record proves a decision was not altered after it was written. It does not prove who wrote it; the reviewer's name is free text. A record key proves only that the writer held the key.
+- `stats` describes the sentences that were reviewed, which are the doubtful ones first. It is not an estimate of overall accuracy.
+- The evidence passage is the chunk the first model scored highest, up to about 400 tokens. It is where the model looked, not a minimal quotation.
+- No reviewer has used this yet. It is tested against its own specification, not against practice.
+
 ## 0.6.0 — two models and a third answer
 
 ### What changed

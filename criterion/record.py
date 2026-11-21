@@ -34,7 +34,7 @@ import os
 from dataclasses import dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from criterion._version import __version__
 from criterion.capture import CapturedPair
@@ -55,9 +55,14 @@ class RecordCorruptError(ValueError):
 #   1 — legacy (<= 0.3.1): fields concatenated with no delimiter. Ambiguous:
 #       a digit can be moved across a field boundary without changing the
 #       hash. Still verifiable so old ledgers keep working; never written.
-#   2 — canonical JSON over every integrity-protected field, domain-separated.
-HASH_SCHEME = 2
+#   2 — canonical JSON over every integrity-protected field, domain-separated
+#       (0.4.0 to 0.6.0). The field list is frozen below: fields added later
+#       are not part of a scheme-2 id, so those ledgers keep verifying.
+#   3 — as 2, over the current field list: adds the entry kind, per-sentence
+#       support and reviewer decisions (0.7.0).
+HASH_SCHEME = 3
 _DOMAIN = b"criterion-record-v2\n"
+_DOMAIN_V3 = b"criterion-record-v3\n"
 _KEY_ENV = "CRITERION_RECORD_KEY"
 
 
@@ -100,12 +105,33 @@ class RecordEntry:
     hash_scheme: int = 1                             # absent in legacy entries
     mac: str | None = None                           # HMAC-SHA256(key, entry_id), if keyed
 
+    # 0.7.0 (hash scheme 3)
+    kind: str = "verdict"                            # "verdict" or "review"
+    # One row per judged output sentence: index, text_hash, evidence_hash,
+    # support, models, confidence. Protected by the entry id.
+    sentences: list[dict[str, Any]] | None = None
+    # The sentences and the source passage each was best supported by, in the
+    # same order. Like source_text these are bound by hash, not by the id, so
+    # they can be withheld or redacted without breaking the chain.
+    sentence_texts: list[dict[str, Any]] | None = None
+    # For kind == "review": {"of": verdict entry id, "sentence": index or
+    # None, "decision": ..., "reviewer": ..., "note": ...}.
+    review: dict[str, Any] | None = None
+
 
 _ENTRY_FIELDS = tuple(f.name for f in fields(RecordEntry))
 # Not covered by entry_id: the id itself, the MAC over it, and the raw texts
 # (bound through source_hash/output_hash so they can be withheld or redacted
 # without breaking the chain).
-_UNHASHED = {"entry_id", "mac", "source_text", "output_text"}
+_UNHASHED = {"entry_id", "mac", "source_text", "output_text", "sentence_texts"}
+# Frozen: exactly the fields a scheme-2 id was computed over.
+_V2_FIELDS = (
+    "recorded_at", "predecessor_hash", "source_hash", "output_hash",
+    "trust_score", "trust_level", "total_divergences", "divergences",
+    "bond_divergences", "broken_bonds", "summary", "criterion_version",
+    "mode", "detector_config", "hash_scheme",
+)
+_V3_ONLY = ("kind", "sentences", "sentence_texts", "review")
 
 
 def _serialize_divergence(d: Any) -> dict[str, Any]:
@@ -151,10 +177,21 @@ def _hash_content(*parts: str) -> str:
 
 
 def _entry_id_v2(data: dict[str, Any]) -> str:
-    """Scheme 2 entry id: SHA-256 over canonical JSON of the protected fields."""
-    protected = {k: data.get(k) for k in _ENTRY_FIELDS if k not in _UNHASHED}
+    """Scheme 2 entry id: SHA-256 over canonical JSON of the frozen field list."""
+    protected = {k: data.get(k) for k in _V2_FIELDS}
     blob = json.dumps(protected, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(_DOMAIN + blob.encode("utf-8")).hexdigest()
+
+
+def _entry_id_v3(data: dict[str, Any]) -> str:
+    """Scheme 3 entry id: SHA-256 over canonical JSON of every protected field."""
+    protected = {k: data.get(k) for k in _ENTRY_FIELDS if k not in _UNHASHED}
+    blob = json.dumps(protected, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(_DOMAIN_V3 + blob.encode("utf-8")).hexdigest()
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _resolve_key(key: bytes | str | None) -> bytes | None:
@@ -225,7 +262,32 @@ def _entry_to_dict(entry: RecordEntry) -> dict[str, Any]:
     data = {name: getattr(entry, name) for name in _ENTRY_FIELDS}
     if data["mac"] is None:
         del data["mac"]
+    if entry.hash_scheme < 3:
+        # Older entries are written back exactly as they were read.
+        for name in _V3_ONLY:
+            del data[name]
     return data
+
+
+def _append(path: Path, data: dict[str, Any], mac_key: bytes | None) -> RecordEntry:
+    """Chain `data` onto the ledger under an exclusive lock and write it."""
+    with open(path, "a+b") as f:
+        if fcntl is not None:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            data["predecessor_hash"] = _last_hash_from(f)
+            data["entry_id"] = _entry_id_v3(data)
+            data["mac"] = _mac(mac_key, data["entry_id"]) if mac_key else None
+            entry = RecordEntry(**data)
+            line = json.dumps(_entry_to_dict(entry), ensure_ascii=False) + "\n"
+            f.seek(0, os.SEEK_END)
+            f.write(line.encode("utf-8"))
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            if fcntl is not None:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    return entry
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +304,7 @@ def preserve(
     detector_config: dict[str, Any] | None = None,
     store_text: bool = True,
     key: bytes | str | None = None,
+    sentences: Sequence[dict[str, Any]] | None = None,
 ) -> RecordEntry:
     """Preserve a complete Criterion assessment to the append-only record.
 
@@ -261,6 +324,9 @@ def preserve(
         store_text: If False, store only the SHA-256 of source and output,
             not the texts themselves (for sensitive material).
         key: HMAC key for a keyed chain. Defaults to $CRITERION_RECORD_KEY.
+        sentences: Per-sentence support rows from the verdict (text, support,
+            models, confidence, evidence). Recorded so a reviewer can later be
+            shown exactly what the machine saw and decided.
 
     Returns:
         The RecordEntry that was written.
@@ -268,6 +334,24 @@ def preserve(
     path = Path(record_path) if record_path else _DEFAULT_RECORD_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     mac_key = _resolve_key(key)
+
+    rows: list[dict[str, Any]] | None = None
+    texts: list[dict[str, Any]] | None = None
+    if sentences:
+        rows, texts = [], []
+        for i, s in enumerate(sentences):
+            evidence = s.get("evidence") or ""
+            rows.append({
+                "index": i,
+                "text_hash": _sha(s["text"]),
+                "evidence_hash": _sha(evidence) if evidence else None,
+                "support": s.get("support"),
+                "models": s.get("models"),
+                "confidence": s.get("confidence"),
+            })
+            texts.append({"text": s["text"], "evidence": evidence or None})
+        if not store_text:
+            texts = None
 
     if detector_config is None and report is not None:
         detector_config = dict(getattr(report, "capabilities", {}) or {}) or None
@@ -289,25 +373,80 @@ def preserve(
         "mode": mode,
         "detector_config": detector_config,
         "hash_scheme": HASH_SCHEME,
+        "kind": "verdict",
+        "sentences": rows,
+        "sentence_texts": texts,
+        "review": None,
     }
+    return _append(path, data, mac_key)
 
-    with open(path, "a+b") as f:
-        if fcntl is not None:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        try:
-            data["predecessor_hash"] = _last_hash_from(f)
-            data["entry_id"] = _entry_id_v2(data)
-            data["mac"] = _mac(mac_key, data["entry_id"]) if mac_key else None
-            entry = RecordEntry(**data)
-            line = json.dumps(_entry_to_dict(entry), ensure_ascii=False) + "\n"
-            f.seek(0, os.SEEK_END)
-            f.write(line.encode("utf-8"))
-            f.flush()
-            os.fsync(f.fileno())
-        finally:
-            if fcntl is not None:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-    return entry
+
+DECISIONS = ("supported", "unsupported", "unclear")
+
+
+def preserve_review(
+    target: RecordEntry,
+    *,
+    sentence: int | None,
+    decision: str,
+    reviewer: str,
+    note: str = "",
+    record_path: Path | str | None = None,
+    key: bytes | str | None = None,
+) -> RecordEntry:
+    """Append a reviewer's decision about a recorded verdict.
+
+    The decision is a new entry chained after everything before it; the
+    verdict it concerns is never altered. It names that verdict by entry id
+    and repeats its source and output hashes, so it cannot be re-pointed at
+    different text.
+
+    What this proves: that the decision was recorded in this position and has
+    not been changed since. It does not prove who made it — `reviewer` is
+    whatever name was given. With a record key, it proves the entry was
+    written by someone holding the key.
+    """
+    if decision not in DECISIONS:
+        raise ValueError(f"decision must be one of {DECISIONS}, got {decision!r}")
+    if not isinstance(reviewer, str) or not reviewer.strip():
+        raise ValueError("a reviewer name is required")
+    if target.kind != "verdict":
+        raise ValueError("only a verdict can be reviewed, not another review")
+    if sentence is not None:
+        count = len(target.sentences or [])
+        if isinstance(sentence, bool) or not isinstance(sentence, int) or not 0 <= sentence < count:
+            raise ValueError(f"sentence {sentence!r} is not one of the {count} recorded for this verdict")
+    path = Path(record_path) if record_path else _DEFAULT_RECORD_PATH
+    where = "the output" if sentence is None else f"sentence {sentence}"
+    data: dict[str, Any] = {
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "source_hash": target.source_hash,
+        "output_hash": target.output_hash,
+        "source_text": None,
+        "output_text": None,
+        "trust_score": 0.0,
+        "trust_level": "review",
+        "total_divergences": 0,
+        "divergences": [],
+        "bond_divergences": [],
+        "broken_bonds": 0,
+        "summary": f"{reviewer.strip()} judged {where} of {target.entry_id[:12]} {decision}.",
+        "criterion_version": __version__,
+        "mode": target.mode,
+        "detector_config": None,
+        "hash_scheme": HASH_SCHEME,
+        "kind": "review",
+        "sentences": None,
+        "sentence_texts": None,
+        "review": {
+            "of": target.entry_id,
+            "sentence": sentence,
+            "decision": decision,
+            "reviewer": reviewer.strip(),
+            "note": note or "",
+        },
+    }
+    return _append(path, data, _resolve_key(key))
 
 
 def read_record(record_path: Path | str | None = None) -> list[RecordEntry]:
@@ -337,7 +476,13 @@ def _recompute_entry_id(entry: RecordEntry) -> str:
 
     If this doesn't match the stored entry_id, the content was tampered with.
     """
+    if entry.hash_scheme == 3:
+        return _entry_id_v3({name: getattr(entry, name) for name in _ENTRY_FIELDS})
     if entry.hash_scheme == 2:
+        if any(getattr(entry, name) != RecordEntry.__dataclass_fields__[name].default for name in _V3_ONLY):
+            # A scheme-2 id does not cover these fields; accepting them would
+            # let unprotected content ride on a valid hash.
+            raise ValueError("scheme-2 entry carries fields its hash does not protect")
         return _entry_id_v2(_entry_to_dict(entry))
     if entry.hash_scheme != 1:
         raise ValueError(f"unknown hash_scheme {entry.hash_scheme!r}")
@@ -372,6 +517,38 @@ def _verify_text_hashes(entry: RecordEntry) -> str | None:
         actual = hashlib.sha256(text.encode("utf-8")).hexdigest()
         if actual != stored:
             return f"{label} text hash mismatch: stored {str(stored)[:12]}, computed {actual[:12]}"
+    if entry.sentence_texts is not None:
+        rows = entry.sentences or []
+        if not isinstance(entry.sentence_texts, list) or len(entry.sentence_texts) != len(rows):
+            return "sentence texts do not line up with the recorded sentences"
+        for row, t in zip(rows, entry.sentence_texts):
+            if not isinstance(t, dict) or not isinstance(t.get("text"), str):
+                return "sentence text is not a string"
+            if _sha(t["text"]) != row.get("text_hash"):
+                return f"sentence {row.get('index')} text hash mismatch"
+            evidence = t.get("evidence")
+            if evidence is not None and (not isinstance(evidence, str) or _sha(evidence) != row.get("evidence_hash")):
+                return f"sentence {row.get('index')} evidence hash mismatch"
+    return None
+
+
+def _verify_kind(entry: RecordEntry, earlier: dict[str, RecordEntry]) -> str | None:
+    """A review must point at an earlier verdict of the same text."""
+    if entry.kind == "verdict":
+        return "a verdict entry carries a review" if entry.review is not None else None
+    if entry.kind != "review":
+        return f"unknown entry kind {entry.kind!r}"
+    r = entry.review
+    if not isinstance(r, dict) or r.get("decision") not in DECISIONS or not r.get("reviewer"):
+        return "malformed review"
+    target = earlier.get(r.get("of"))
+    if target is None or target.kind != "verdict":
+        return "review does not refer to an earlier verdict in this record"
+    if (target.source_hash, target.output_hash) != (entry.source_hash, entry.output_hash):
+        return "review is bound to different text than the verdict it names"
+    n = r.get("sentence")
+    if n is not None and (isinstance(n, bool) or not isinstance(n, int) or not 0 <= n < len(target.sentences or [])):
+        return "review names a sentence the verdict does not have"
     return None
 
 
@@ -413,6 +590,7 @@ def verify_chain(
     if entries and entries[0].predecessor_hash != "genesis":
         return False, f"first entry predecessor is {entries[0].predecessor_hash!r}, expected 'genesis'"
 
+    seen: dict[str, RecordEntry] = {}
     for i, entry in enumerate(entries):
         # Check predecessor chain
         if i > 0 and entry.predecessor_hash != entries[i - 1].entry_id:
@@ -436,6 +614,11 @@ def verify_chain(
         text_err = _verify_text_hashes(entry)
         if text_err:
             return False, f"entry {i}: {text_err}"
+
+        kind_err = _verify_kind(entry, seen)
+        if kind_err:
+            return False, f"entry {i}: {kind_err}"
+        seen[entry.entry_id] = entry
 
         if mac_key is not None:
             if not entry.mac:

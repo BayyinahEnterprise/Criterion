@@ -249,6 +249,9 @@ class DivergenceReport:
     # Output atom index -> each grounding model's own score, when more than
     # one model scored the sentence. Their disagreement is the "unsure" signal.
     support_models: dict[int, dict[str, float]] = field(default_factory=dict)
+    # Output atom index -> the source passage that supported it best: what a
+    # reviewer needs beside the sentence to check the machine's call.
+    support_evidence: dict[int, str] = field(default_factory=dict)
 
     @property
     def total(self) -> int:
@@ -1301,6 +1304,7 @@ def find_divergences(
     # a statement, taken as the maximum over chunks of the source.
     scores: dict[int, float] = {}
     score_models: dict[int, dict[str, float]] = {}
+    score_evidence: dict[int, str] = {}
     if _USE_SCORER:
         # Fragments are not scored here. With a question they become
         # statements ("The answer to ... is Delhi."), and those are judged by
@@ -1312,6 +1316,7 @@ def find_divergences(
                 _clean(pair.source.raw_text), [_clean(a.text) for a in judged],
             )
             scores = {a.index: float(r[0]) for a, r in zip(judged, results)}
+            score_evidence = {a.index: str(r[1]) for a, r in zip(judged, results) if len(r) > 1 and r[1]}
             score_models = {
                 a.index: {k: float(v) for k, v in r.members.items()}
                 for a, r in zip(judged, results) if len(getattr(r, "members", {})) > 1
@@ -1594,4 +1599,5 @@ def find_divergences(
             k: {n: round(v, 4) for n, v in m.items()}
             for k, m in sorted(score_models.items()) if scorer_ok
         },
+        support_evidence={k: v for k, v in sorted(score_evidence.items()) if scorer_ok and k in support},
     )
